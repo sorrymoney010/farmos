@@ -1,0 +1,9 @@
+.env
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+web/node_modules/
+web/.next/
+*.log

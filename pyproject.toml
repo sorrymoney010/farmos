@@ -1,0 +1,83 @@
+[project]
+name = "farmos"
+version = "1.0.0"
+description = "FARMOS - Distributed Edge Revenue Operating System"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.0",
+    "uvicorn[standard]==0.32.0",
+    "sqlalchemy==2.0.35",
+    "alembic==1.14.0",
+    "asyncpg==0.29.0",
+    "redis==5.2.0",
+    "pydantic==2.9.2",
+    "pydantic-settings==2.6.1",
+    "python-jose[cryptography]==3.3.0",
+    "passlib[bcrypt]==1.7.4",
+    "python-multipart==0.0.9",
+    "httpx==0.27.2",
+    "structlog==25.1.0",
+    "python-json-logger==2.0.7",
+    "tenacity==8.5.0",
+    "prometheus-client==0.20.0",
+    "celery==5.4.0",
+    "flower==2.0.1",
+    "apscheduler==3.11.0",
+    "cryptography>=43.0.2",
+    "pydantic-extra-types==2.10.0",
+    "email-validator==2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.3",
+    "pytest-asyncio==0.24.0",
+    "pytest-cov==5.0.0",
+    "pytest-mock==3.14.0",
+    "httpx==0.27.2",
+    "factory-boy==3.3.1",
+    "faker>=20.0.0",
+    "black==24.10.0",
+    "isort==5.13.2",
+    "ruff==0.6.9",
+    "mypy==1.13.0",
+    "pre-commit==3.8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+include = ["app*"]
+
+[tool.setuptools.package-dir]
+"" = "backend"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+select = ["E", "F", "I", "UP", "W", "C90", "B", "SIM", "T20"]
+ignore = ["E501", "B008"]
+src = ["backend"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true

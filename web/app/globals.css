@@ -1,0 +1,20 @@
+:root {
+  color: #eaf5ed;
+  background: #10231a;
+  font-family: Arial, sans-serif;
+}
+
+body { margin: 0; }
+
+main {
+  max-width: 44rem;
+  margin: 15vh auto;
+  padding: 2rem;
+  border: 1px solid #467658;
+  border-radius: 0.75rem;
+  background: #163524;
+}
+
+.eyebrow { color: #8ee0a6; font-weight: 700; letter-spacing: 0.12em; }
+.status { color: #8ee0a6; }
+a { color: #b9f6c8; }

@@ -1,0 +1,160 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: farmos-postgres
+    environment:
+      POSTGRES_USER: farmos
+      POSTGRES_PASSWORD: farmos
+      POSTGRES_DB: farmos
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U farmos -d farmos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - farmos-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: farmos-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - farmos-network
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: farmos-backend
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://farmos:farmos@postgres:5432/farmos
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production-min-32-chars}
+      - CORS_ORIGINS=["http://localhost:3002","http://localhost:8000"]
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@example.com}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-ChangeMe123!}
+      - ADMIN_FULL_NAME=${ADMIN_FULL_NAME:-FARMOS Admin}
+      - SIMULATOR_ENABLED=${SIMULATOR_ENABLED:-true}
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.scripts.seed_admin &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    networks:
+      - farmos-network
+
+  worker-scheduler:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: farmos-worker-scheduler
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://farmos:farmos@postgres:5432/farmos
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production-min-32-chars}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python -m app.workers.scheduler_worker
+    networks:
+      - farmos-network
+
+  worker-verification:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: farmos-worker-verification
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://farmos:farmos@postgres:5432/farmos
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production-min-32-chars}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python -m app.workers.verification_worker
+    networks:
+      - farmos-network
+
+  worker-reconciliation:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: farmos-worker-reconciliation
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://farmos:farmos@postgres:5432/farmos
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production-min-32-chars}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python -m app.workers.reconciliation_worker
+    networks:
+      - farmos-network
+
+  web:
+    image: node:20-alpine
+    container_name: farmos-web
+    working_dir: /app
+    volumes:
+      - ./web:/app
+    ports:
+      - "3002:3000"
+    command: sh -c "npm install && npm run dev"
+    networks:
+      - farmos-network
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: farmos-mailhog
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - farmos-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  farmos-network:
+    driver: bridge
