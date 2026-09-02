@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">FARMOS Node</string>
+    <string name="enroll_token_hint">Enrollment token (scan QR or paste)</string>
+    <string name="enroll_button">Enroll device</string>
+</resources>

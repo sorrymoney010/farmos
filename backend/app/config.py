@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     PASSWORD_MIN_LENGTH: int = 12
+    DEVICE_ENROLLMENT_TOKEN_EXPIRE_MINUTES: int = 15
+    NODE_REQUEST_MAX_SKEW_SECONDS: int = 300
+    NODE_TOKEN_EXPIRE_HOURS: int = 24
 
     # CORS
     CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8000"]

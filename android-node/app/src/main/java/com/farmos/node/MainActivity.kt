@@ -1,0 +1,61 @@
+package com.farmos.node
+
+import android.os.Bundle
+import android.widget.Button
+import android.widget.EditText
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import com.farmos.node.identity.DeviceIdentityStore
+import com.farmos.node.node.NodeEnrollmentRepository
+import com.farmos.node.node.NodeEnrollmentScheduler
+import kotlinx.coroutines.launch
+
+class MainActivity : AppCompatActivity() {
+    private lateinit var identityStore: DeviceIdentityStore
+    private lateinit var repository: NodeEnrollmentRepository
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        identityStore = DeviceIdentityStore(this)
+        repository = NodeEnrollmentRepository(this, identityStore)
+
+        val statusBody = findViewById<TextView>(R.id.statusBody)
+        val tokenInput = findViewById<EditText>(R.id.tokenInput)
+        val enrollButton = findViewById<Button>(R.id.enrollButton)
+
+        // Already enrolled? Show status and ensure periodic heartbeats run.
+        if (identityStore.isEnrolled()) {
+            statusBody.text = "Enrolled as ${identityStore.humanId()}. Heartbeats scheduled."
+            NodeEnrollmentScheduler.onEnrolled(this)
+        }
+
+        // Deep link: farmos://enroll?token=...
+        val data = intent?.data
+        if (data != null && data.scheme == "farmos" && data.host == "enroll") {
+            val token = data.getQueryParameter("token")
+            if (!token.isNullOrBlank()) tokenInput.setText(token)
+        }
+
+        enrollButton.setOnClickListener {
+            val token = tokenInput.text.toString().trim()
+            if (token.isBlank()) {
+                statusBody.text = "Enter or scan an enrollment token first."
+                return@setOnClickListener
+            }
+            lifecycleScope.launch {
+                statusBody.text = "Generating Keystore identity and enrolling…"
+                runCatching { repository.enroll(token) }
+                    .onSuccess { result ->
+                        NodeEnrollmentScheduler.onEnrolled(this@MainActivity)
+                        statusBody.text = "Device ${result.humanId} is ${result.status}"
+                    }
+                    .onFailure { error ->
+                        statusBody.text = "Enrollment failed: ${error.message}"
+                    }
+            }
+        }
+    }
+}
