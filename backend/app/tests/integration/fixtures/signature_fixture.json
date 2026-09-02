@@ -1,0 +1,26 @@
+{
+  "comment": "Cross-language canonicalization/signature golden fixture. SHA256withECDSA over JSON with sorted keys and no whitespace (separators ',:' and sort_keys=True), mirroring Android JSONObject canonicalize + TreeSet key ordering.",
+  "device_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKHL0ahJZgsG62UBTS6JqXMY27beH\nBYvVNe10chb5+XrbGpSemLEqFk5HpR3/Zh+3QWsgH0/s1GIMPBNm984Lag==\n-----END PUBLIC KEY-----\n",
+  "payload": {
+    "enrollment_token": "enroll-fixture-token",
+    "device_public_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKHL0ahJZgsG62UBTS6JqXMY27beH\nBYvVNe10chb5+XrbGpSemLEqFk5HpR3/Zh+3QWsgH0/s1GIMPBNm984Lag==\n-----END PUBLIC KEY-----\n",
+    "hardware_fingerprint": "sha256:fixturefingerprint00000000000000000000",
+    "profile": {
+      "manufacturer": "Google",
+      "model": "Pixel 8",
+      "android_version": "14",
+      "architecture": "arm64-v8a",
+      "cpu_cores": 8,
+      "ram_mb": 8192,
+      "storage_total_mb": 128000,
+      "capabilities": [
+        "cpu_compute",
+        "network",
+        "storage"
+      ]
+    },
+    "request_nonce": "fixturenonce00000000000000000000000",
+    "request_timestamp": "2026-09-01T00:00:00+00:00"
+  },
+  "signature_base64": "MEQCIDwjYAGA9c2c3+slFnHKMY8wmj3c4jZk+urOI4gEooLhAiBg2fZI+jcZTseFIMCHyreELlvvl+eHdlQlvE+0jkk07Q=="
+}

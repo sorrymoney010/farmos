@@ -1,17 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Release / default: cleartext is NEVER permitted. HTTPS only. -->
 <network-security-config>
-    <!-- Production: cleartext traffic is NEVER permitted. -->
     <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-
-    <!-- Dev-only LAN lab override. Activated by setting FARMOS_ALLOW_INSECURE_HTTP=true
-         in BuildConfig; it permits cleartext ONLY to the local backend 10.0.2.2.
-         This domain-config is inert unless cleartextTrafficPermitted is enabled at build
-         time (see build.gradle.kts). Never enable for production builds. -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">10.0.2.2</domain>
-    </domain-config>
 </network-security-config>

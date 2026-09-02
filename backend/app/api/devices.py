@@ -93,6 +93,17 @@ async def enroll_device(
     if not nonce_ok:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Replay detected")
 
+    # Verify the device signature BEFORE consuming the one-time token, so an invalid
+    # signed request cannot burn a valid enrollment token.
+    try:
+        verify_request_signature(
+            req.device_public_key,
+            req.model_dump(mode="json", exclude={"signature"}),
+            req.signature,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
+
     token_data = await consume_enrollment_token(req.enrollment_token)
     if not token_data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired enrollment token")
@@ -103,15 +114,6 @@ async def enroll_device(
     provider = provider_result.scalar_one_or_none()
     if not provider:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No provider record for token owner")
-
-    try:
-        verify_request_signature(
-            req.device_public_key,
-            req.model_dump(mode="json", exclude={"signature"}),
-            req.signature,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
 
     existing = await db.execute(select(Device).where(Device.public_key == req.device_public_key))
     if existing.scalar_one_or_none():

@@ -1,29 +1,79 @@
-"""Node enrollment and signed request verification for FARMOS."""
+"""Node enrollment and signed request verification for FARMOS.
+
+Security notes
+--------------
+- Enrollment tokens are generated with cryptographic randomness (secrets.token_urlsafe).
+- Consumption is atomic via Redis GETDEL so a token can never be used twice and a
+  failed/aborted attempt cannot "burn" a valid token by leaving it half-deleted.
+- The device signature is verified by the caller BEFORE consume_enrollment_token is
+  invoked, so an invalid signed request cannot consume a good token.
+- Redis clients are created via an app-lifetime pool (init/close in main.lifespan) and
+  handed out per-call from a connection pool; no process-global async client is reused
+  across event loops.
+"""
 
 from __future__ import annotations
 
 import base64
 import json
+import secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from jose import jwt
 from redis.asyncio import Redis
+from redis.asyncio.connection import ConnectionPool
 
 from app.config import settings
+
+_POOL: ConnectionPool | None = None
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def get_redis() -> Redis:
-    # Do NOT cache at module scope: a cached client binds to the first asyncio
-    # event loop it touches and raises "Event loop is closed" when later used
-    # from a different loop (e.g. across TestClient sessions / request cycles).
-    return Redis.from_url(settings.REDIS_URL, decode_responses=True)
+def init_redis() -> None:
+    """Create the shared Redis connection pool (called once at app startup)."""
+    global _POOL
+    if _POOL is None:
+        _POOL = ConnectionPool.from_url(settings.REDIS_URL, decode_responses=True, max_connections=20)
+
+
+async def close_redis() -> None:
+    """Dispose the shared Redis connection pool (called at app shutdown)."""
+    global _POOL
+    if _POOL is not None:
+        await _POOL.aclose()
+        _POOL = None
+
+
+@asynccontextmanager
+async def redis_client() -> AsyncIterator[Redis]:
+    """Yield a Redis client bound to the shared pool; the client is closed after use.
+
+    We never retain an async Redis object across event loops: it is created from the
+    pool on demand and `aclose()`d when the request/path finishes.
+    """
+    if _POOL is None:
+        # Test contexts that skip lifespan startup get a throwaway pool per client.
+        pool = ConnectionPool.from_url(settings.REDIS_URL, decode_responses=True, max_connections=4)
+        client = Redis(connection_pool=pool)
+        try:
+            yield client
+        finally:
+            await client.aclose()
+            await pool.aclose()
+        return
+    client = Redis(connection_pool=_POOL)
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
 
 def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
@@ -36,37 +86,40 @@ async def issue_enrollment_token(
     farm_id: str | None = None,
     expires_in_minutes: int = 15,
 ) -> tuple[str, datetime]:
-    token = f"enroll-{base64.urlsafe_b64encode(canonical_json_bytes({'u': owner_user_id, 't': utcnow().isoformat()})).decode().rstrip('=')[:40]}"
+    # Cryptographically random token (no predictable structure).
+    token = f"enroll-{secrets.token_urlsafe(32)}"
     expires_at = utcnow() + timedelta(minutes=expires_in_minutes)
-    redis = await get_redis()
-    await redis.setex(
-        f"farmos:enrollment:{token}",
-        int(timedelta(minutes=expires_in_minutes).total_seconds()),
-        json.dumps(
-            {
-                "owner_user_id": owner_user_id,
-                "farm_id": farm_id,
-                "expires_at": expires_at.isoformat(),
-            }
-        ),
-    )
+    async with redis_client() as redis:
+        await redis.setex(
+            f"farmos:enrollment:{token}",
+            int(timedelta(minutes=expires_in_minutes).total_seconds()),
+            json.dumps(
+                {
+                    "owner_user_id": owner_user_id,
+                    "farm_id": farm_id,
+                    "expires_at": expires_at.isoformat(),
+                }
+            ),
+        )
     return token, expires_at
 
 
 async def consume_enrollment_token(token: str) -> dict[str, Any] | None:
-    redis = await get_redis()
-    key = f"farmos:enrollment:{token}"
-    raw = await redis.get(key)
+    """Atomically fetch-and-delete the enrollment token (Redis GETDEL).
+
+    Returns the token payload or None if missing/expired. Because GETDEL is atomic,
+    exactly one caller can consume a given token.
+    """
+    async with redis_client() as redis:
+        raw = await redis.getdel(f"farmos:enrollment:{token}")
     if not raw:
         return None
-    await redis.delete(key)
     return json.loads(raw)
 
 
 async def mark_nonce_used(scope: str, nonce: str, ttl_seconds: int = 600) -> bool:
-    redis = await get_redis()
-    key = f"farmos:nonce:{scope}:{nonce}"
-    return bool(await redis.set(key, "1", ex=ttl_seconds, nx=True))
+    async with redis_client() as redis:
+        return bool(await redis.set(f"farmos:nonce:{scope}:{nonce}", "1", ex=ttl_seconds, nx=True))
 
 
 def ensure_timestamp_fresh(timestamp: str, *, max_skew_seconds: int = 300) -> datetime:

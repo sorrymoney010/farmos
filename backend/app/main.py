@@ -11,6 +11,7 @@ from app.middleware.request_id import RequestIDMiddleware
 from app.middleware.audit import AuditMiddleware
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.db.session import init_db, close_db
+from app.security.node_auth import init_redis, close_redis
 from app.api import api_router
 
 logger = get_logger(__name__)
@@ -21,8 +22,10 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger.info("farmos_starting", app_env=settings.APP_ENV)
     await init_db()
+    init_redis()
     yield
     await close_db()
+    await close_redis()
     logger.info("farmos_shutdown")
 
 

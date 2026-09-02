@@ -15,6 +15,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
+from app.security.node_auth import verify_request_signature
+
 pytest_plugins = ["pytest_asyncio"]
 
 ADMIN_EMAIL = "admin@example.com"
@@ -136,16 +138,68 @@ def test_reused_enrollment_token_rejected(client, admin_token):
     assert "Invalid or expired enrollment token" in second.text
 
 
-def test_invalid_signature_rejected(client, admin_token):
+def test_golden_signature_fixture():
+    # Shared cross-language fixture: Python emits the canonical form that the
+    # Android app must reproduce (sorted keys, no whitespace). This test proves
+    # the fixture's signature verifies under Python's canonicalization, which is
+    # the contract both sides must honor.
+    import os
+
+    fixture_path = os.path.join(os.path.dirname(__file__), "fixtures", "signature_fixture.json")
+    with open(fixture_path) as f:
+        fixture = json.load(f)
+    verify_request_signature(
+        fixture["device_public_key_pem"],
+        fixture["payload"],
+        fixture["signature_base64"],
+    )
+
+
+
+def test_invalid_signature_does_not_consume_token(client, admin_token):
+    # An invalid signed request must NOT burn the token: a subsequent valid
+    # signed request with the same token must still succeed.
     token = _issue_enrollment_token(client, admin_token)
     real_key = _new_key()
     wrong_key = _new_key()
-    payload = _build_enroll_payload(real_key, token)
-    # Re-sign with the wrong key -> signature does not match the enrolled public key.
-    payload["signature"] = _sign(wrong_key, payload)
-    resp = client.post(f"{BASE}/devices/enroll", json=payload)
-    assert resp.status_code == 401, resp.text
-    assert "Invalid device signature" in resp.text
+    bad_payload = _build_enroll_payload(real_key, token)
+    bad_payload["signature"] = _sign(wrong_key, bad_payload)
+    bad = client.post(f"{BASE}/devices/enroll", json=bad_payload)
+    assert bad.status_code == 401, bad.text
+    assert "Invalid device signature" in bad.text
+
+    # Same token, now correctly signed, should enroll.
+    good, _key, _payload = _enroll(client, admin_token, token)
+    assert good.status_code == 200, good.text
+    assert "device_id" in good.json()
+
+
+def test_concurrent_enrollment_token_single_use(client, admin_token):
+    # Prove atomic GETDEL: exactly one of two near-simultaneous enrollments with the
+    # same token succeeds; the other gets "Invalid or expired enrollment token".
+    import asyncio
+
+    token = _issue_enrollment_token(client, admin_token)
+
+    async def _attempt(key, loop):
+        payload = _build_enroll_payload(key, token)
+        # Run inside the TestClient (sync) from the event loop thread.
+        return await loop.run_in_executor(None, lambda: client.post(f"{BASE}/devices/enroll", json=payload))
+
+    async def _race():
+        loop = asyncio.get_event_loop()
+        k1, k2 = _new_key(), _new_key()
+        r1, r2 = await asyncio.gather(_attempt(k1, loop), _attempt(k2, loop))
+        return r1, r2
+
+    r1, r2 = asyncio.run(_race())
+    statuses = {r1.status_code, r2.status_code}
+    # Exactly one 200, the other 400 invalid/expired token.
+    assert statuses == {200, 400}, f"unexpected: {r1.status_code} {r2.status_code}"
+    assert (r1.status_code == 200) ^ (r2.status_code == 200)
+    texts = (r1.text + r2.text)
+    assert "Invalid or expired enrollment token" in texts
+
 
 
 def test_expired_timestamp_rejected(client, admin_token):

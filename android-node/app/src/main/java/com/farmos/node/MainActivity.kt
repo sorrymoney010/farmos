@@ -4,6 +4,7 @@ import android.os.Bundle
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.farmos.node.identity.DeviceIdentityStore
@@ -23,10 +24,14 @@ class MainActivity : AppCompatActivity() {
         repository = NodeEnrollmentRepository(this, identityStore)
 
         val statusBody = findViewById<TextView>(R.id.statusBody)
+        val apiUrlInput = findViewById<EditText>(R.id.apiUrlInput)
         val tokenInput = findViewById<EditText>(R.id.tokenInput)
         val enrollButton = findViewById<Button>(R.id.enrollButton)
+        val saveUrlButton = findViewById<Button>(R.id.saveUrlButton)
 
-        // Already enrolled? Show status and ensure periodic heartbeats run.
+        // Pre-fill the configured API URL (default HTTPS build URL unless overridden).
+        apiUrlInput.setText(identityStore.apiBaseUrl())
+        // Already enrolled? Show status and ensure heartbeats run.
         if (identityStore.isEnrolled()) {
             statusBody.text = "Enrolled as ${identityStore.humanId()}. Heartbeats scheduled."
             NodeEnrollmentScheduler.onEnrolled(this)
@@ -37,6 +42,13 @@ class MainActivity : AppCompatActivity() {
         if (data != null && data.scheme == "farmos" && data.host == "enroll") {
             val token = data.getQueryParameter("token")
             if (!token.isNullOrBlank()) tokenInput.setText(token)
+        }
+
+        saveUrlButton.setOnClickListener {
+            val url = apiUrlInput.text.toString().trim()
+            runCatching { identityStore.setApiBase(url) }
+                .onSuccess { Toast.makeText(this, "API URL saved", Toast.LENGTH_SHORT).show() }
+                .onFailure { Toast.makeText(this, "HTTPS URL required", Toast.LENGTH_SHORT).show() }
         }
 
         enrollButton.setOnClickListener {
@@ -57,5 +69,11 @@ class MainActivity : AppCompatActivity() {
                     }
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Stop the in-process loop when the activity is destroyed (fallback worker remains).
+        com.farmos.node.node.HeartbeatLoop.stop()
     }
 }

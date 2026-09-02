@@ -1,0 +1,7 @@
+# Gradle cache
+.gradle/
+# Build outputs
+app/build/
+build/
+# Local SDK/config
+local.properties

@@ -23,14 +23,10 @@ class NodeEnrollmentRepository(
     private val context: Context,
     private val identityStore: DeviceIdentityStore,
 ) {
-    private val client: OkHttpClient by lazy {
-        val builder = OkHttpClient.Builder()
-        // Dev-only cleartext HTTP for LAN lab. Never enabled in production builds.
-        if (identityStore.allowInsecureHttp()) {
-            builder.hostnameVerifier { _, _ -> true }
-        }
-        builder.build()
-    }
+    // No custom hostnameVerifier: HTTPS certificate validation is always enforced.
+    // Cleartext (lab only) is permitted solely via network-security-config for the
+    // configured LAN host; OkHttp still refuses cleartext anywhere else.
+    private val client: OkHttpClient by lazy { OkHttpClient.Builder().build() }
     private val jsonType = "application/json".toMediaType()
 
     /** Enroll using a one-time token from the admin console. */

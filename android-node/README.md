@@ -1,46 +1,66 @@
 # Sprint 11 — Android secure node identity
 
-This module implements the first real-phone path for FARMOS:
+This module implements the first real-phone path for FARMOS: a device proves its
+identity with an Android Keystore-backed key, enrolls with a short-lived one-time
+token issued by the admin console, and sends signed heartbeats.
 
-1. Generate a Keystore-backed EC P-256 device keypair.
-2. Request a one-time enrollment token from the FARMOS backend.
-3. Submit enrollment signed by the device private key.
-4. Store `device_id`, `human_id`, and `node_token` locally.
-5. Send signed heartbeats using the node token and device key.
-6. Transition the node to `ACTIVE` after the first valid signed heartbeat.
+## Security model
 
-## Current limitations
-- No Android SDK / adb is installed on this Mac, so an APK was not built here.
-- No physical Android phone is connected to this session, so a real-device enrollment could not be executed yet.
-- `FARMOS_ANDROID_ENROLLMENT_BEARER` is required at runtime for controlled Sprint 11 lab enrollment.
+- **Device key:** EC P-256 keypair generated in Android Keystore (`AndroidKeyStore`).
+  Private key is non-exportable. The public key (PEM) is sent at enrollment and used
+  to verify every signed request.
+- **No admin credentials on device:** the app never holds an admin bearer token. The
+  admin console issues a one-time enrollment token (QR / `farmos://enroll?token=…` /
+  manual paste). The phone only *consumes* it.
+- **Signed requests:** enrollment and every heartbeat are signed over a canonical JSON
+  form (sorted keys, no whitespace) with `SHA256withECDSA`. The backend verifies the
+  signature **before** consuming the one-time token, so a bad signed request cannot
+  burn a valid token.
+- **Atomic token consumption:** Redis `GETDEL` — exactly one enrollment succeeds per
+  token; reuse returns 400. A concurrency test proves it.
+- **Encrypted token at rest:** the node bearer token is encrypted with an Android
+  Keystore-backed AES-256-GCM key (`TokenCipher`); never stored in plaintext
+  SharedPreferences.
+- **Transport:** HTTPS by default. `10.0.2.2` (emulator loopback) cleartext is allowed
+  **only** in the `debug`/LAN-lab network-security-config and only via the build flag
+  `FARMOS_ALLOW_INSECURE_HTTP=true`. The `release`/main config forbids cleartext
+  everywhere. Hostname verification is never disabled.
 
-## Key files
-- `app/src/main/java/com/farmos/node/identity/AndroidKeyStoreManager.kt`
-- `app/src/main/java/com/farmos/node/identity/DeviceIdentityStore.kt`
-- `app/src/main/java/com/farmos/node/node/NodeEnrollmentRepository.kt`
-- `app/src/main/java/com/farmos/node/node/NodeHeartbeatWorker.kt`
-- `app/src/main/java/com/farmos/node/MainActivity.kt`
+## Heartbeat ↔ offline policy reconciliation
 
-## Backend contract added in Sprint 11
-- `POST /api/v1/devices/enrollment-token`
-- `POST /api/v1/devices/enroll`
-- `POST /api/v1/devices/{device_id}/heartbeat`
+Backend policy (seeded `system_settings`):
+- `node.heartbeat_interval_seconds = 30`
+- `node.offline_after_seconds = 180` (3 minutes)
 
-Enrollment and heartbeat bodies include:
-- `request_nonce`
-- `request_timestamp`
-- `signature`
+Android design:
+- **Primary cadence:** an in-process 30s loop (`HeartbeatLoop`) while the app process
+  is alive. This tolerates up to ~5 missed beats before the 3-minute offline mark.
+- **Fallback:** a `WorkManager` periodic worker (`NodeHeartbeatWorker`) at the platform
+  minimum 15-minute interval, so heartbeats survive process death. WorkManager cannot
+  meet a 3-minute policy on its own; the in-process loop is the primary mechanism and
+  the 3-minute grace absorbs Doze deferrals.
+- On enroll and on boot (if already enrolled), both are scheduled.
 
-The backend verifies:
-- one-time enrollment token
-- request timestamp freshness
-- nonce replay protection in Redis
-- ECDSA signature against the enrolled device public key
-- node token/device ID match for heartbeats
+## Build & verify
 
-## Real phone checklist
-1. Install Android Studio + SDK 34.
-2. Build and install the app on one Android 12+ phone.
-3. Export a short-lived `FARMOS_ANDROID_ENROLLMENT_BEARER` for lab enrollment.
-4. Tap **Enroll device**.
-5. Confirm the device appears in FARMOS admin fleet with status `ACTIVE`.
+Requires Android SDK + JDK 17. Network-security config is variant-specific:
+`app/src/main/res/xml/network_security_config.xml` (release: no cleartext) and
+`app/src/debug/...` (LAN-lab cleartext to 10.0.2.2).
+
+```
+export ANDROID_HOME=~/Library/Android/sdk
+export JAVA_HOME=<jdk17>
+./gradlew :app:assembleDebug :app:testDebugUnitTest
+```
+
+Unit tests (`app/src/test`) run on JVM via Robolectric and prove: the shared golden
+signature fixture verifies under Android's `Signature` API; release-style builds reject
+cleartext API URLs; the node token is encrypted at rest.
+
+## Cross-language canonicalization contract
+
+`android-node/signature_fixture.json` is the golden fixture shared with the Python
+backend tests (`backend/app/tests/integration/fixtures/signature_fixture.json`). Both
+sides must produce the identical canonical JSON byte string for a given payload; the
+Android `canonicalize` (JSONObject + `TreeSet` key ordering) and Python
+`json.dumps(..., sort_keys=True, separators=(",",":"))` are equivalent.

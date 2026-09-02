@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug / LAN-lab variant ONLY. Cleartext is permitted to a single configured
+     loopback/LAN host (10.0.2.2). This file is NOT present in release builds;
+     release uses the base-config with cleartextTrafficPermitted="false". Never
+     ship a build that merges this file to production. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>
