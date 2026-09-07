@@ -12,6 +12,7 @@ import androidx.work.WorkManager
  */
 object NodeEnrollmentScheduler {
     fun onEnrolled(context: Context) {
+        android.util.Log.i(" FarmosHb", "NodeEnrollmentScheduler.onEnrolled: scheduling heartbeat")
         // Immediate heartbeat.
         WorkManager.getInstance(context)
             .enqueue(OneTimeWorkRequestBuilder<NodeHeartbeatWorker>().build())

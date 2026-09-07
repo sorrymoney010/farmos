@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
@@ -77,6 +78,27 @@ async def create_enrollment_token(
         "enrollment_token": token,
         "expires_at": expires_at.isoformat(),
         "qr_payload": f"farmos://enroll?token={token}",
+    }
+
+
+@router.post("/staging/enrollment-token")
+async def staging_enrollment_token(
+    payload: EnrollmentTokenRequest,
+    request: Request,
+):
+    admin_secret = request.headers.get("X-Staging-Enroll-Admin", "")
+    if not admin_secret or not secrets.compare_digest(admin_secret, settings.STAGING_ENROLL_ADMIN_SECRET):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid staging admin secret")
+    owner_user_id = settings.STAGING_ADMIN_USER_ID or "29443001-3ae8-40e3-91f8-969d97eda184"
+    token, expires_at = await issue_enrollment_token(
+        owner_user_id,
+        farm_id=payload.farm_id,
+        expires_in_minutes=payload.expires_in_minutes,
+    )
+    return {
+        "enrollment_token": token,
+        "expires_at": expires_at.isoformat(),
+        "qr_payload": f"{settings.PUBLIC_API_BASE_URL or str(request.base_url).rstrip('/')}/enroll?token={token}",
     }
 
 

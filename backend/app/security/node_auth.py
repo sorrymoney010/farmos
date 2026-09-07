@@ -136,9 +136,16 @@ def ensure_timestamp_fresh(timestamp: str, *, max_skew_seconds: int = 300) -> da
 
 
 def verify_request_signature(public_key_pem: str, payload: dict[str, Any], signature_b64: str) -> None:
+    import logging
+    logger = logging.getLogger(" FarmosVerify")
     public_key = serialization.load_pem_public_key(public_key_pem.encode())
     signature = base64.b64decode(signature_b64)
     body = canonical_json_bytes(payload)
+    logger.warning("VERIFY_DEBUG: public_key=%s", public_key_pem[:80])
+    logger.warning("VERIFY_DEBUG: payload=%s", json.dumps(payload, sort_keys=True, separators=(",",":"))[:200])
+    logger.warning("VERIFY_DEBUG: canonical_bytes=%s", body.decode()[:200])
+    logger.warning("VERIFY_DEBUG: signature_b64=%s", signature_b64[:40])
+    logger.warning("VERIFY_DEBUG: signature_raw=%s", signature.hex()[:80])
     try:
         public_key.verify(signature, body, ec.ECDSA(hashes.SHA256()))
     except InvalidSignature as exc:

@@ -46,11 +46,13 @@ services:
       - DATABASE_URL=postgresql+asyncpg://farmos:farmos@postgres:5432/farmos
       - REDIS_URL=redis://redis:6379/0
       - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production-min-32-chars}
-      - CORS_ORIGINS=["http://localhost:3002","http://localhost:8000"]
+      - CORS_ORIGINS=["http://localhost:3000","http://localhost:8000","https://depends-goals-stays-portsmouth.trycloudflare.com"]
       - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@example.com}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-ChangeMe123!}
       - ADMIN_FULL_NAME=${ADMIN_FULL_NAME:-FARMOS Admin}
       - SIMULATOR_ENABLED=${SIMULATOR_ENABLED:-true}
+      - STAGING_ENROLL_ADMIN_SECRET=${STAGING_ENROLL_ADMIN_SECRET:-}
+      - PUBLIC_API_BASE_URL=${PUBLIC_API_BASE_URL:-}
     volumes:
       - ./backend:/app
     ports:

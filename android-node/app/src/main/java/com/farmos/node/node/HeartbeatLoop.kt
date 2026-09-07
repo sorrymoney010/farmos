@@ -25,12 +25,21 @@ object HeartbeatLoop {
     private var job: Job? = null
 
     fun start(context: Context, scope: CoroutineScope = CoroutineScope(Dispatchers.IO)) {
-        if (job?.isActive == true) return
+        if (job?.isActive == true) {
+            android.util.Log.i(" FarmosHb", "HeartbeatLoop: already running, skipping start")
+            return
+        }
+        android.util.Log.i(" FarmosHb", "HeartbeatLoop: starting")
         job = scope.launch {
             val store = DeviceIdentityStore(context)
+            android.util.Log.i(" FarmosHb", "HeartbeatLoop: launched, isEnrolled=${store.isEnrolled()}")
             while (isActive) {
                 if (store.isEnrolled()) {
+                    android.util.Log.d(" FarmosHb", "HeartbeatLoop: sending heartbeat")
                     runCatching { NodeEnrollmentRepository(context, store).heartbeatOnce() }
+                        .onFailure { e -> android.util.Log.e(" FarmosHb", "HeartbeatLoop error", e) }
+                } else {
+                    android.util.Log.w(" FarmosHb", "HeartbeatLoop: not enrolled, skipping")
                 }
                 delay(INTERVAL_MS)
             }

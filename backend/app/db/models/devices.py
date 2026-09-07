@@ -35,8 +35,8 @@ class Device(Base):
     provider_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("providers.id", ondelete="CASCADE"), nullable=False
     )
-    farm_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("farms.id", ondelete="SET NULL"), nullable=True
+    farm_id: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True
     )
     human_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
     public_key: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
@@ -70,7 +70,9 @@ class Device(Base):
     )
 
     provider: Mapped["Provider"] = relationship("Provider", back_populates="devices")
-    farm: Mapped[Optional["Farm"]] = relationship("Farm")
+    # farm_id is now a free-form string tag (not a FK to farms.id), so the ORM
+    # relationship to Farm is intentionally removed to avoid a type mismatch on the
+    # join condition between VARCHAR farm_id and UUID farms.id.
     heartbeats: Mapped[list["DeviceHeartbeat"]] = relationship(
         "DeviceHeartbeat", back_populates="device", cascade="all, delete-orphan"
     )

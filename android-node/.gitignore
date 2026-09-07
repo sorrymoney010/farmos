@@ -5,3 +5,7 @@ app/build/
 build/
 # Local SDK/config
 local.properties
+android-node/keystore/
+
+# Local development keystores
+keystore/

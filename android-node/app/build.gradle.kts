@@ -14,16 +14,16 @@ android {
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField("String", "FARMOS_API_BASE_URL", "\"https://farmos.local\"")
+        buildConfigField("String", "FARMOS_API_BASE_URL", "\"https://depends-goals-stays-portsmouth.trycloudflare.com\"")
         buildConfigField("boolean", "FARMOS_ALLOW_INSECURE_HTTP", "false")
     }
 
     buildTypes {
         debug {
             isMinifyEnabled = false
-            // Dev LAN lab: enable cleartext HTTP to emulator loopback only.
-            buildConfigField("boolean", "FARMOS_ALLOW_INSECURE_HTTP", "true")
-            buildConfigField("String", "FARMOS_API_BASE_URL", "\"http://10.0.2.2:8000\"")
+            // Staging HTTPS tunnel — no cleartext, no emulator loopback.
+            buildConfigField("boolean", "FARMOS_ALLOW_INSECURE_HTTP", "false")
+            buildConfigField("String", "FARMOS_API_BASE_URL", "\"https://depends-goals-stays-portsmouth.trycloudflare.com\"")
         }
         release {
             isMinifyEnabled = false

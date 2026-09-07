@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     RATE_LIMIT_REQUESTS: int = 100
     RATE_LIMIT_WINDOW_SECONDS: int = 60
 
+    # Staging remote enrollment admin convenience header.
+    # This is NOT a user bearer token; it is only for the standalone staging admin page.
+    STAGING_ENROLL_ADMIN_SECRET: str = Field(
+        default_factory=lambda: secrets.token_urlsafe(24),
+        min_length=16,
+    )
+    PUBLIC_API_BASE_URL: str = ""
+    STAGING_ADMIN_USER_ID: str = ""
+
     # Observability
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "json"

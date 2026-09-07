@@ -20,7 +20,10 @@ import java.util.TreeSet
  */
 class DeviceIdentityStore(context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("farmos-node", MODE_PRIVATE)
-    private val keystore = AndroidKeyStoreManager()
+    // URL settings and enrollment-state reads must work before a signing operation.
+    // AndroidKeyStore is only required when public-key material is accessed or a
+    // payload is signed, so defer its initialization until one of those operations.
+    private val keystore: AndroidKeyStoreManager by lazy { AndroidKeyStoreManager() }
 
     fun publicKeyPem(): String = keystore.publicKeyPem()
 

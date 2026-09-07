@@ -67,6 +67,8 @@ class NodeEnrollmentRepository(
     suspend fun heartbeatOnce(): JSONObject = withContext(Dispatchers.IO) {
         val deviceId = identityStore.deviceId() ?: error("Device not enrolled")
         val nodeToken = identityStore.nodeToken() ?: error("No node token")
+        android.util.Log.i(" FarmosHb", "heartbeatOnce: deviceId=$deviceId nodeToken=${nodeToken.take(8)}...")
+        // Build the body that will be sent (includes extra fields for the API).
         val payload = JSONObject()
             .put("observed_at", Instant.now().toString())
             .put("battery_pct", 80.0)
@@ -79,20 +81,46 @@ class NodeEnrollmentRepository(
             .put("app_version", "1.0")
             .put("request_nonce", nonce())
             .put("request_timestamp", Instant.now().toString())
+        // The backend verifies the signature over the HeartbeatRequest model fields
+        // via model_dump(mode="json", exclude={"signature"}) — which includes ALL
+        // fields except signature: observed_at, battery_pct, charging, temperature_c,
+        // cpu_util_pct, ram_used_mb, storage_free_mb, network, app_version,
+        // request_nonce, request_timestamp. So we sign the FULL payload minus the
+        // signature field itself (which is exactly what canonicalize does on the
+        // payload as built above — same keys, same values, sorted).
         payload.put("signature", identityStore.signJsonObject(payload))
-        postJson("/api/v1/devices/$deviceId/heartbeat", payload, nodeToken)
+        android.util.Log.i(" FarmosHb", "heartbeatOnce: POST $deviceId/heartbeat")
+        val result = postJson("/api/v1/devices/$deviceId/heartbeat", payload, nodeToken)
+        android.util.Log.i(" FarmosHb", "heartbeatOnce: OK ${result.optString("status","?")}")
+        result
     }
 
     private fun postJson(path: String, body: JSONObject, bearer: String? = null): JSONObject {
-        val url = identityStore.apiBaseUrl().removeSuffix("/") + path
-        val requestBuilder = Request.Builder()
-            .url(url)
-            .post(body.toString().toRequestBody(jsonType))
-            .header("Content-Type", "application/json")
-        if (!bearer.isNullOrBlank()) requestBuilder.header("Authorization", "Bearer $bearer")
-        client.newCall(requestBuilder.build()).execute().use { response ->
-            if (!response.isSuccessful) error("HTTP ${response.code}: ${response.body?.string()}")
-            return JSONObject(response.body?.string().orEmpty())
+        try {
+            val url = identityStore.apiBaseUrl().removeSuffix("/") + path
+            android.util.Log.d(" FarmosHb", "postJson: $url bearer=${bearer?.take(8)}...")
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .post(body.toString().toRequestBody(jsonType))
+                .header("Content-Type", "application/json")
+            if (!bearer.isNullOrBlank()) requestBuilder.header("Authorization", "Bearer $bearer")
+            android.util.Log.d(" FarmosHb", "postJson: calling execute, dispatching...")
+            val call = client.newCall(requestBuilder.build())
+            android.util.Log.d(" FarmosHb", "postJson: call created, executing synchronously...")
+            call.execute().use { response ->
+                android.util.Log.d(" FarmosHb", "postJson: got response, code=${response.code}, isSuccessful=${response.isSuccessful}")
+                val bodyStr = response.body?.string().orEmpty()
+                android.util.Log.d(" FarmosHb", "postJson: HTTP ${response.code} body=$bodyStr")
+                if (!response.isSuccessful) {
+                    val errMsg = "HTTP ${response.code}: $bodyStr"
+                    android.util.Log.e(" FarmosHb", "postJson: server error: $errMsg")
+                    throw IllegalStateException(errMsg)
+                }
+                return JSONObject(bodyStr)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(" FarmosHb", "postJson FAILED: ${e.javaClass.name}: ${e.message}", e)
+            throw e
         }
     }
 

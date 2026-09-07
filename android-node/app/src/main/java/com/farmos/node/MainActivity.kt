@@ -37,11 +37,15 @@ class MainActivity : AppCompatActivity() {
             NodeEnrollmentScheduler.onEnrolled(this)
         }
 
-        // Deep link: farmos://enroll?token=...
+        // Deep link: farmos://enroll?token=... or App Link https://.../enroll?token=...
         val data = intent?.data
-        if (data != null && data.scheme == "farmos" && data.host == "enroll") {
-            val token = data.getQueryParameter("token")
-            if (!token.isNullOrBlank()) tokenInput.setText(token)
+        if (data != null) {
+            val isEnrollDeepLink = data.scheme == "farmos" && data.host == "enroll"
+            val isEnrollAppLink = data.scheme == "https" && data.path?.startsWith("/enroll") == true
+            if (isEnrollDeepLink || isEnrollAppLink) {
+                val token = data.getQueryParameter("token")
+                if (!token.isNullOrBlank()) tokenInput.setText(token)
+            }
         }
 
         saveUrlButton.setOnClickListener {
