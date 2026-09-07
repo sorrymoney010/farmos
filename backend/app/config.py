@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     PUBLIC_API_BASE_URL: str = ""
     STAGING_ADMIN_USER_ID: str = ""
 
+    # Acurast Processor Management Backend compatibility. The official
+    # processor controls its own wallet, attestation, workload execution and
+    # rewards; FARMOS only receives signed management check-ins.
+    ACURAST_CHECKIN_REFRESH_SECONDS: int = 1800
+
     # Observability
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "json"

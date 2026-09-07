@@ -13,6 +13,7 @@ from app.middleware.rate_limit import RateLimitMiddleware
 from app.db.session import init_db, close_db
 from app.security.node_auth import init_redis, close_redis
 from app.api import api_router
+from app.api.acurast import management_router
 
 logger = get_logger(__name__)
 
@@ -51,6 +52,9 @@ def create_app() -> FastAPI:
         window=settings.RATE_LIMIT_WINDOW_SECONDS,
     )
     app.include_router(api_router)
+    # The official Acurast Processor uses these root paths for a custom
+    # management endpoint; keep them outside FARMOS's versioned user API.
+    app.include_router(management_router, tags=["acurast-management"])
 
     @app.get("/health")
     async def health():

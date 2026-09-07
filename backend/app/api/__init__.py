@@ -2,13 +2,14 @@
 
 from fastapi import APIRouter
 
-from app.api import auth, devices, wallets, jobs, provider, customer, withdrawals, admin
+from app.api import acurast, admin, auth, customer, devices, jobs, provider, wallets, withdrawals
 
 api_router = APIRouter(prefix="/api/v1")
 
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 api_router.include_router(wallets.router, prefix="/wallets", tags=["wallets"])
 api_router.include_router(devices.router, prefix="/devices", tags=["devices"])
+api_router.include_router(acurast.admin_router, prefix="/acurast", tags=["acurast"])
 api_router.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 api_router.include_router(provider.router, prefix="/provider", tags=["provider"])
 api_router.include_router(customer.router, prefix="/customer", tags=["customer"])
