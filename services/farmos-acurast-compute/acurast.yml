@@ -1,0 +1,30 @@
+projects:
+  farmos-compute-service:
+    projectName: "farmos-compute-service"
+    fileUrl: "server.js"
+    network: "mainnet"
+    onlyAttestedDevices: true
+    enableDevtools: true
+    assignmentStrategy:
+      type: "Single"
+    execution:
+      type: "onetime"
+      maxExecutionTimeInMs: 30000
+    maxAllowedStartDelayInMs: 30000
+    usageLimit:
+      maxMemory: 0
+      maxNetworkRequests: 0
+      maxStorage: 0
+    onFailure:
+      action: "retry"
+      maxRetries: 3
+    minProcessorReputation: 0
+    maxCostPerExecution: 0
+    includeEnvironmentVariables: []
+    processorWhitelist: []
+    minProcessorVersions:
+      android: "12"
+    mutability: "Mutable"
+    numberOfReplicas: 1
+defaultProject: "farmos-compute-service"
+includeEnvironmentVariables: []

@@ -1,0 +1,35 @@
+{
+  "projects": {
+    "farmos-compute-service": {
+      "projectName": "farmos-compute-service",
+      "fileUrl": "server.js",
+      "network": "mainnet",
+      "onlyAttestedDevices": true,
+      "execution": {
+        "type": "interval",
+        "intervalMs": 60000,
+        "maxExecutionTimeMs": 50000,
+        "scheduling": {
+          "maxAllowedStartDelayMs": 60000,
+          "startAt": "as_soon_as_possible"
+        }
+      },
+      "assignment": {
+        "strategy": "single",
+        "numberOfReplicas": 1
+      },
+      "resourceLimits": {
+        "maxMemory": 0,
+        "maxNetworkRequests": 0,
+        "maxStorage": 0
+      },
+      "costAndReputation": {
+        "maxCostPerExecution": 0,
+        "minProcessorReputation": 0
+      },
+      "processorWhitelist": [
+        "5EgBZuiRnCfFzvBjgHitNymetm9daFoxEry8vn65sE4QErTj"
+      ]
+    }
+  }
+}

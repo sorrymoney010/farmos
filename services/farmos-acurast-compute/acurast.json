@@ -1,0 +1,37 @@
+{
+  "projects": {
+    "farmos-compute-service": {
+      "projectName": "farmos-compute-service",
+      "fileUrl": "server.js",
+      "network": "mainnet",
+      "onlyAttestedDevices": true,
+      "execution": {
+        "type": "interval",
+        "maxExecutionTimeInMs": 50000,
+        "intervalInMs": 300000
+      },
+      "maxAllowedStartDelayInMs": 60000,
+      "assignmentStrategy": {
+        "type": "Single"
+      },
+      "numberOfReplicas": 1,
+      "usageLimit": {
+        "maxMemory": 0,
+        "maxNetworkRequests": 0,
+        "maxStorage": 0
+      },
+      "maxCostPerExecution": 0,
+      "minProcessorReputation": 0,
+      "includeEnvironmentVariables": [],
+      "processorWhitelist": [
+        "5C4iuPWJMooQkEuz1jJHPM9UPSwWAY7HdZjoJHwarh1EnbFS"
+      ],
+      "minProcessorVersions": {
+        "android": "12"
+      },
+      "mutability": "Mutable"
+    }
+  },
+  "defaultProject": "farmos-compute-service",
+  "includeEnvironmentVariables": []
+}

@@ -1,0 +1,13 @@
+{
+  "name": "farmos-acurast-compute",
+  "version": "1.0.0",
+  "description": "FARMOS Acurast Compute Service - deploys to Acurast processor",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "curl -s http://localhost:3000/health"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

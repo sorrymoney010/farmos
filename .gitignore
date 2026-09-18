@@ -1,9 +1,48 @@
-.env
-.venv/
-.pytest_cache/
+# macOS
+.DS_Store
+*.DS_Store
+
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
 *.egg-info/
-web/node_modules/
-web/.next/
+dist/
+build/
 *.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Secrets
+auth.json
+*.pem
+*.key
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+Thumbs.db
+ehthumbs.db
+
+# FARMOS specific
+services/farmos-acurast-compute/.acurast/
+services/*.DS_Store
+

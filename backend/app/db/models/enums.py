@@ -77,6 +77,13 @@ class JobStatus(str, enum.Enum):
     QUARANTINED = "QUARANTINED"
 
 
+class JobType(str, enum.Enum):
+    HTTP_CHECK = "http_check"
+    API_REQUEST = "api_request"
+    MONITOR = "monitor"
+    DATA_TRANSFORM = "data_transform"
+
+
 class JobEventActorType(str, enum.Enum):
     SYSTEM = "SYSTEM"
     NODE = "NODE"
@@ -113,6 +120,8 @@ class LedgerAccountType(str, enum.Enum):
     FARMOS_REVENUE = "FARMOS_REVENUE"
     OPERATING_RESERVE = "OPERATING_RESERVE"
     HARDWARE_REINVESTMENT = "HARDWARE_REINVESTMENT"
+    DEVICE_EARNINGS_TEST = "DEVICE_EARNINGS_TEST"
+    DEVICE_EARNINGS_REAL = "DEVICE_EARNINGS_REAL"
 
 
 class OpportunityStatus(str, enum.Enum):
@@ -149,3 +158,7 @@ class AuditEventType(str, enum.Enum):
     PROVIDER_CREATED = "PROVIDER_CREATED"
     PROVIDER_STATUS_CHANGED = "PROVIDER_STATUS_CHANGED"
     FARM_CREATED = "FARM_CREATED"
+    JOB_DISPATCHED = "JOB_DISPATCHED"
+    JOB_ACCEPTED = "JOB_ACCEPTED"
+    JOB_RESULT_SUBMITTED = "JOB_RESULT_SUBMITTED"
+    JOB_VERIFIED = "JOB_VERIFIED"
