@@ -58,12 +58,16 @@ class MainActivity : AppCompatActivity() {
         enrollButton.setOnClickListener {
             val token = tokenInput.text.toString().trim()
             if (token.isBlank()) {
-                statusBody.text = "Enter or scan an enrollment token first."
+                statusBody.text = "Enter a claim code or enrollment token first."
                 return@setOnClickListener
             }
             lifecycleScope.launch {
                 statusBody.text = "Generating Keystore identity and enrolling…"
-                runCatching { repository.enroll(token) }
+                // Short codes (no "enroll-" prefix) go through claim-code exchange (wireless path).
+                val useClaim = !token.startsWith("enroll-") && token.length <= 16
+                runCatching {
+                    if (useClaim) repository.enrollWithClaimCode(token) else repository.enroll(token)
+                }
                     .onSuccess { result ->
                         NodeEnrollmentScheduler.onEnrolled(this@MainActivity)
                         statusBody.text = "Device ${result.humanId} is ${result.status}"

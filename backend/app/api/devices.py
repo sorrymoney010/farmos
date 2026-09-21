@@ -22,6 +22,8 @@ from app.logging import get_logger
 from app.security.node_auth import (
     consume_enrollment_token,
     ensure_timestamp_fresh,
+    exchange_claim_code,
+    issue_claim_code,
     issue_enrollment_token,
     issue_node_token,
     mark_nonce_used,
@@ -37,6 +39,15 @@ node_bearer = HTTPBearer(auto_error=False)
 class EnrollmentTokenRequest(BaseModel):
     farm_id: str | None = None
     expires_in_minutes: int = Field(default=settings.DEVICE_ENROLLMENT_TOKEN_EXPIRE_MINUTES, ge=1, le=60)
+
+
+class ClaimCodeRequest(BaseModel):
+    farm_id: str | None = None
+    expires_in_minutes: int = Field(default=settings.CLAIM_CODE_EXPIRE_MINUTES, ge=1, le=60)
+
+
+class ClaimCodeExchangeRequest(BaseModel):
+    claim_code: str = Field(min_length=1, max_length=32)
 
 
 class EnrollRequest(BaseModel):
@@ -99,6 +110,68 @@ async def staging_enrollment_token(
         "enrollment_token": token,
         "expires_at": expires_at.isoformat(),
         "qr_payload": f"{settings.PUBLIC_API_BASE_URL or str(request.base_url).rstrip('/')}/enroll?token={token}",
+    }
+
+
+
+@router.post("/claim-code")
+async def create_claim_code(
+    payload: ClaimCodeRequest,
+    current_user=Depends(require_roles(RoleName.OWNER, RoleName.ADMIN, RoleName.PROVIDER)),
+):
+    """Mint a short claim/pairing code for wireless (no-USB) device onboarding."""
+    code, expires_at = await issue_claim_code(
+        str(current_user.id),
+        farm_id=payload.farm_id,
+        expires_in_minutes=payload.expires_in_minutes,
+    )
+    return {
+        "claim_code": code,
+        "expires_at": expires_at.isoformat(),
+        "instructions": "Enter this code on the device (FARMOS Node app or agent). No USB required.",
+    }
+
+
+@router.post("/staging/claim-code")
+async def staging_claim_code(
+    payload: ClaimCodeRequest,
+    request: Request,
+):
+    """Staging mint of a short claim code (X-Staging-Enroll-Admin)."""
+    admin_secret = request.headers.get("X-Staging-Enroll-Admin", "")
+    if not admin_secret or not secrets.compare_digest(admin_secret, settings.STAGING_ENROLL_ADMIN_SECRET):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid staging admin secret")
+    owner_user_id = settings.STAGING_ADMIN_USER_ID or "29443001-3ae8-40e3-91f8-969d97eda184"
+    code, expires_at = await issue_claim_code(
+        owner_user_id,
+        farm_id=payload.farm_id,
+        expires_in_minutes=payload.expires_in_minutes,
+    )
+    return {
+        "claim_code": code,
+        "expires_at": expires_at.isoformat(),
+        "staging_fixed_code": "123" if settings.STAGING_CLAIM_CODES else None,
+        "instructions": (
+            "Enter claim_code on the device. When STAGING_CLAIM_CODES=true, code 123 also works."
+        ),
+    }
+
+
+@router.post("/claim-code/exchange")
+async def exchange_claim_code_endpoint(payload: ClaimCodeExchangeRequest):
+    """Exchange a short claim code for a one-time enrollment token (network path, no USB).
+
+    The device then calls POST /enroll with the enrollment token and a device signature.
+    Signature verification still happens before the enrollment token is consumed.
+    """
+    try:
+        token, expires_at = await exchange_claim_code(payload.claim_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return {
+        "enrollment_token": token,
+        "expires_at": expires_at.isoformat(),
+        "qr_payload": f"farmos://enroll?token={token}",
     }
 
 

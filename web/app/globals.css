@@ -1,20 +1,112 @@
 :root {
   color: #eaf5ed;
   background: #10231a;
-  font-family: Arial, sans-serif;
+  font-family: Arial, Helvetica, sans-serif;
 }
 
 body { margin: 0; }
 
-main {
-  max-width: 44rem;
-  margin: 15vh auto;
-  padding: 2rem;
+.dash {
+  max-width: 72rem;
+  margin: 2rem auto 4rem;
+  padding: 0 1.25rem;
+}
+
+.hero {
   border: 1px solid #467658;
   border-radius: 0.75rem;
   background: #163524;
+  padding: 1.5rem 1.75rem;
+  margin-bottom: 1rem;
 }
 
-.eyebrow { color: #8ee0a6; font-weight: 700; letter-spacing: 0.12em; }
+.eyebrow { color: #8ee0a6; font-weight: 700; letter-spacing: 0.12em; margin: 0; }
 .status { color: #8ee0a6; }
+.muted { color: #9bb9a8; font-size: 0.92rem; }
 a { color: #b9f6c8; }
+.error { color: #ffb4b4; }
+
+.panel {
+  border: 1px solid #467658;
+  border-radius: 0.75rem;
+  background: #163524;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.panel h2 { margin: 0; font-size: 1.1rem; }
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+
+@media (min-width: 960px) {
+  .grid { grid-template-columns: 1.2fr 1fr; gap: 1rem; }
+  .grid > :last-child { grid-column: 1 / -1; }
+}
+
+.field { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.75rem; }
+input {
+  background: #10231a;
+  border: 1px solid #467658;
+  color: #eaf5ed;
+  border-radius: 0.5rem;
+  padding: 0.65rem 0.75rem;
+}
+
+.row { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+
+button {
+  background: #2f8f55;
+  color: #04140c;
+  border: 0;
+  border-radius: 0.5rem;
+  padding: 0.6rem 1rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+button.secondary { background: #254f37; color: #dff7e7; }
+button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+th, td { text-align: left; padding: 0.45rem 0.35rem; border-bottom: 1px solid #2a4d3a; vertical-align: top; }
+th { color: #8ee0a6; font-weight: 600; }
+
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+.badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+  background: #254f37;
+  font-size: 0.78rem;
+}
+.badge-ok { background: #1f6b3c; }
+
+.stats > div {
+  min-width: 6rem;
+  background: #10231a;
+  border: 1px solid #2a4d3a;
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.75rem;
+}
+.stats strong { display: block; font-size: 1.25rem; }
+.stats span { color: #9bb9a8; font-size: 0.8rem; }
+
+.claim-box {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  border: 1px dashed #8ee0a6;
+  background: #10231a;
+}
