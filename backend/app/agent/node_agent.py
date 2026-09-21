@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -274,20 +276,24 @@ class FarmosDeviceAgent:
 
         result_uri = json.dumps(result)
 
-        payload = {
+        # Sign ONLY the fields jobs.py verifies (exclude execution_metrics).
+        to_sign = {
             "request_nonce": uuid4().hex,
             "request_timestamp": datetime.now(timezone.utc).isoformat(),
             "job_id": job_id,
             "device_id": self.device_id,
             "result_hash": result_hash,
             "result_uri": result_uri,
+        }
+        payload = {
+            **to_sign,
             "execution_metrics": {
                 "device_id": self.device_id,
                 "device_human_id": self.human_id,
                 "executed_at": datetime.now(timezone.utc).isoformat(),
             },
+            "signature": sign_payload(self.private_key, to_sign),
         }
-        payload["signature"] = sign_payload(self.private_key, payload)
 
         resp = await client.post(
             f"{self.api_base}/api/v1/jobs/device/jobs/{job_id}/result",

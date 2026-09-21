@@ -371,13 +371,20 @@ async def device_accept_job(
     except ValueError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token subject")
 
+    device_row = await db.execute(select(Device).where(Device.id == device_id))
+    device = device_row.scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    if not device.public_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Device has no public key")
+
     # Verify timestamp freshness
     try:
         ensure_timestamp_fresh(req.request_timestamp, max_skew_seconds=settings.NODE_REQUEST_MAX_SKEW_SECONDS)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    # Verify signature
+    # Verify signature against the enrolled device key (node JWT has no pubkey claim).
     payload_to_verify: dict[str, str] = {
         "request_nonce": req.request_nonce,
         "request_timestamp": req.request_timestamp,
@@ -385,7 +392,7 @@ async def device_accept_job(
         "device_id": device_id_str,
     }
     try:
-        verify_request_signature(token_payload.get("pubkey", ""), payload_to_verify, req.signature)
+        verify_request_signature(device.public_key, payload_to_verify, req.signature)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
 
@@ -466,13 +473,20 @@ async def device_submit_result(
     except ValueError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token subject")
 
+    device_row = await db.execute(select(Device).where(Device.id == device_id))
+    device = device_row.scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    if not device.public_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Device has no public key")
+
     # Verify timestamp freshness
     try:
         ensure_timestamp_fresh(req.request_timestamp, max_skew_seconds=settings.NODE_REQUEST_MAX_SKEW_SECONDS)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    # Verify signature
+    # Verify signature against the enrolled device key (node JWT has no pubkey claim).
     payload_to_verify: dict[str, str] = {
         "request_nonce": req.request_nonce,
         "request_timestamp": req.request_timestamp,
@@ -482,7 +496,7 @@ async def device_submit_result(
         "result_uri": req.result_uri or "",
     }
     try:
-        verify_request_signature(token_payload.get("pubkey", ""), payload_to_verify, req.signature)
+        verify_request_signature(device.public_key, payload_to_verify, req.signature)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
 

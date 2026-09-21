@@ -77,3 +77,17 @@ wireless ADB / sideload). Prefer short claim codes on the phone:
    `/api/v1/devices/enroll` path.
 
 See `docs/WIRELESS_ONBOARDING.md` for the full operator flow and APK-without-USB notes.
+
+## Job loop (Wi‑Fi http_check)
+
+After enroll, `JobLoop` runs alongside `HeartbeatLoop`:
+
+1. `POST /api/v1/jobs/device/jobs/next` (Bearer node token)
+2. `POST …/accept` — signed over `request_nonce`, `request_timestamp`, `job_id`, `device_id`
+3. Execute `http_check` (OkHttp GET/POST per job payload)
+4. `POST …/result` — signed over nonce/ts/job_id/device_id/`result_hash`/`result_uri`
+   (`execution_metrics` is sent but **not** part of the signature)
+
+`result_hash` = SHA-256 hex of canonical JSON of the result object (same as Python agent).
+
+Wireless APK install: `./scripts/wireless_apk_install.sh <phone-ip>` — see `docs/WIRELESS_ONBOARDING.md`.

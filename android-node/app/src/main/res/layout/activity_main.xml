@@ -20,6 +20,14 @@
         android:layout_marginTop="16dp"
         android:text="Idle" />
 
+    <TextView
+        android:id="@+id/jobStatusBody"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/job_status_idle"
+        android:textSize="13sp" />
+
     <EditText
         android:id="@+id/apiUrlInput"
         android:layout_width="match_parent"

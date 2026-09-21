@@ -29,6 +29,10 @@ class DeviceIdentityStore(context: Context) {
 
     fun signJsonObject(json: JSONObject): String = keystore.sign(canonicalize(json).toByteArray())
 
+    /** Public canonical JSON (sorted keys, compact) matching Python json.dumps(..., sort_keys=True, separators=(",",":")). */
+    fun canonicalJson(json: JSONObject): String = canonicalize(json)
+
+
     fun saveEnrollment(deviceId: String, humanId: String, nodeToken: String) {
         prefs.edit()
             .putString(KEY_DEVICE_ID, deviceId)
