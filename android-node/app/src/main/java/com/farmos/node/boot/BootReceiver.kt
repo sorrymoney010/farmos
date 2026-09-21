@@ -4,18 +4,16 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import com.farmos.node.identity.DeviceIdentityStore
-import com.farmos.node.node.HeartbeatLoop
-import com.farmos.node.node.NodeHeartbeatWorker
+import com.farmos.node.node.NodeEnrollmentScheduler
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
-            // Only schedule periodic heartbeats if already enrolled. Enrollment
-            // always requires an explicit token from the admin console.
+            // Only schedule heartbeats + jobs if already enrolled. Enrollment
+            // always requires an explicit token / claim code from the operator.
             val store = DeviceIdentityStore(context)
             if (store.isEnrolled()) {
-                NodeHeartbeatWorker.schedule(context)
-                HeartbeatLoop.start(context)
+                NodeEnrollmentScheduler.onEnrolled(context)
             }
         }
     }
