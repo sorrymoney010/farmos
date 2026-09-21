@@ -40,6 +40,19 @@ class NodeEnrollmentRepository(
         EnrollmentResult(deviceId, humanId, response.optString("status", "BENCHMARKING"))
     }
 
+    /**
+     * Wireless onboarding: exchange a short claim/pairing code for an enrollment
+     * token over the network, then enroll. No USB/ADB required for the claim step.
+     * Staging may accept fixed code "123" when STAGING_CLAIM_CODES is enabled.
+     */
+    suspend fun enrollWithClaimCode(claimCode: String): EnrollmentResult = withContext(Dispatchers.IO) {
+        val exchangeBody = JSONObject().put("claim_code", claimCode.trim())
+        val exchange = postJson("/api/v1/devices/claim-code/exchange", exchangeBody)
+        val enrollmentToken = exchange.getString("enrollment_token")
+        enroll(enrollmentToken)
+    }
+
+
     private fun buildEnrollPayload(enrollmentToken: String): JSONObject {
         val payload = JSONObject()
             .put("enrollment_token", enrollmentToken)

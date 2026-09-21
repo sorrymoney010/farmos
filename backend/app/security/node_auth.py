@@ -174,3 +174,85 @@ def verify_node_token(token: str) -> dict[str, Any] | None:
     if "NODE" not in payload.get("roles", []):
         return None
     return payload
+
+
+# ── Short claim / pairing codes ──────────────────────────────────────────────
+# Short codes map to the same owner/farm payload as enrollment tokens. Devices
+# exchange a claim code over the network for a one-time enrollment token, then
+# enroll with the existing signed /enroll path (signature verified BEFORE token
+# consume). Production codes are random; staging may optionally accept "123".
+
+_CLAIM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
+_STAGING_FIXED_CLAIM_CODE = "123"
+
+
+def _generate_claim_code(length: int | None = None) -> str:
+    n = length or settings.CLAIM_CODE_LENGTH
+    return "".join(secrets.choice(_CLAIM_ALPHABET) for _ in range(n))
+
+
+async def issue_claim_code(
+    owner_user_id: str,
+    *,
+    farm_id: str | None = None,
+    expires_in_minutes: int | None = None,
+) -> tuple[str, datetime]:
+    """Mint a short claim/pairing code stored in Redis (maps to owner + farm)."""
+    minutes = expires_in_minutes or settings.CLAIM_CODE_EXPIRE_MINUTES
+    expires_at = utcnow() + timedelta(minutes=minutes)
+    # Retry a few times on the unlikely collision.
+    async with redis_client() as redis:
+        for _ in range(8):
+            code = _generate_claim_code()
+            key = f"farmos:claim:{code}"
+            ok = await redis.set(
+                key,
+                json.dumps(
+                    {
+                        "owner_user_id": owner_user_id,
+                        "farm_id": farm_id,
+                        "expires_at": expires_at.isoformat(),
+                    }
+                ),
+                ex=int(timedelta(minutes=minutes).total_seconds()),
+                nx=True,
+            )
+            if ok:
+                return code, expires_at
+    raise RuntimeError("Unable to allocate unique claim code")
+
+
+async def exchange_claim_code(claim_code: str) -> tuple[str, datetime]:
+    """Exchange a short claim code for a one-time enrollment token.
+
+    Staging convenience: when STAGING_CLAIM_CODES is enabled, code "123" issues
+    an enrollment token for STAGING_ADMIN_USER_ID without consuming a Redis claim
+    (reusable for lab onboarding). Production must keep STAGING_CLAIM_CODES=false
+    so "123" is never accepted.
+    """
+    code = (claim_code or "").strip().upper()
+    # Staging fixed code — only when explicit env flag is on.
+    if settings.STAGING_CLAIM_CODES and code == _STAGING_FIXED_CLAIM_CODE:
+        owner = settings.STAGING_ADMIN_USER_ID or "29443001-3ae8-40e3-91f8-969d97eda184"
+        return await issue_enrollment_token(
+            owner,
+            farm_id=None,
+            expires_in_minutes=settings.DEVICE_ENROLLMENT_TOKEN_EXPIRE_MINUTES,
+        )
+
+    # Normalize: stored codes are uppercase alphanumeric from our alphabet.
+    # Accept lowercase input from phones.
+    async with redis_client() as redis:
+        raw = await redis.getdel(f"farmos:claim:{code}")
+    if not raw:
+        # Also try original casing for any manually seeded keys
+        async with redis_client() as redis:
+            raw = await redis.getdel(f"farmos:claim:{claim_code.strip()}")
+    if not raw:
+        raise ValueError("Invalid or expired claim code")
+    data = json.loads(raw)
+    return await issue_enrollment_token(
+        data["owner_user_id"],
+        farm_id=data.get("farm_id"),
+        expires_in_minutes=settings.DEVICE_ENROLLMENT_TOKEN_EXPIRE_MINUTES,
+    )

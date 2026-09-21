@@ -103,6 +103,29 @@ class FarmosDeviceAgent:
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
+
+    async def enroll_with_claim_code(self, claim_code: str) -> bool:
+        """Wireless onboarding: exchange short claim code → enrollment token → enroll.
+
+        Staging may accept fixed code "123" when STAGING_CLAIM_CODES=true on the server.
+        No USB required — only network reachability to the API.
+        """
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{self.api_base}/api/v1/devices/claim-code/exchange",
+                headers={"Content-Type": "application/json"},
+                json={"claim_code": claim_code.strip()},
+            )
+            if resp.status_code != 200:
+                logger.warning("claim_exchange_failed", status=resp.status_code, body=resp.text[:200])
+                return False
+            enrollment_token = resp.json().get("enrollment_token")
+            if not enrollment_token:
+                logger.warning("claim_exchange_missing_token", body=resp.text[:200])
+                return False
+            return await self.enroll(client, enrollment_token)
+
+
     async def heartbeat(self, client: httpx.AsyncClient) -> bool:
         """Send a heartbeat to FARMOS."""
         if not self.device_id or not self.node_token:
@@ -422,6 +445,17 @@ async def main():
 
     once = os.environ.get("FARMOS_AGENT_ONCE", "").lower() in {"1", "true", "yes"}
     poll_only = os.environ.get("FARMOS_AGENT_POLL_ONLY", "").lower() in {"1", "true", "yes"}
+
+    claim_code = os.environ.get("FARMOS_CLAIM_CODE", "").strip()
+    if claim_code and (not node_token or not device_id):
+        agent = FarmosDeviceAgent(api_base=api_base)
+        ok = await agent.enroll_with_claim_code(claim_code)
+        if not ok:
+            logger.error("claim_enroll_failed", claim_code=claim_code)
+            return
+        node_token = agent.node_token or ""
+        device_id = agent.device_id or ""
+        logger.info("claim_enroll_ok", device_id=device_id)
 
     if not node_token or not device_id:
         logger.error(

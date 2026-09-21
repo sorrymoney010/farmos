@@ -64,3 +64,16 @@ backend tests (`backend/app/tests/integration/fixtures/signature_fixture.json`).
 sides must produce the identical canonical JSON byte string for a given payload; the
 Android `canonicalize` (JSONObject + `TreeSet` key ordering) and Python
 `json.dumps(..., sort_keys=True, separators=(",",":"))` are equivalent.
+
+## Wireless claim codes (no USB)
+
+Enrollment itself is already network-based. USB is only for APK install (or use
+wireless ADB / sideload). Prefer short claim codes on the phone:
+
+1. Operator mints `POST /api/v1/devices/claim-code` (or uses staging `123` when
+   `STAGING_CLAIM_CODES=true`).
+2. On the device, enter the claim code in the token field and tap Enroll.
+3. The app calls `POST /api/v1/devices/claim-code/exchange`, then the normal signed
+   `/api/v1/devices/enroll` path.
+
+See `docs/WIRELESS_ONBOARDING.md` for the full operator flow and APK-without-USB notes.

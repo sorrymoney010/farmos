@@ -76,5 +76,13 @@ class Settings(BaseSettings):
     # Feature Flags
     SIMULATOR_ENABLED: bool = True
 
+    # Wireless short claim/pairing codes.
+    # When True (staging/dev ONLY), claim code "123" is accepted as a fixed convenience
+    # code that issues a real enrollment token for STAGING_ADMIN_USER_ID.
+    # Must remain False in production — never hardcode 123 as a prod path.
+    STAGING_CLAIM_CODES: bool = False
+    CLAIM_CODE_LENGTH: int = 6
+    CLAIM_CODE_EXPIRE_MINUTES: int = 15
+
 
 settings = Settings()

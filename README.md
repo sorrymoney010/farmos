@@ -36,3 +36,10 @@ curl -X POST http://localhost:8000/api/v1/auth/register \
 - First Alembic migration validation
 - Unit/integration tests
 - Admin dashboard shell
+
+### Wireless claim onboarding
+- Mint short claim codes: `POST /api/v1/devices/claim-code`
+- Device exchanges code: `POST /api/v1/devices/claim-code/exchange` → enroll
+- Staging only: set `STAGING_CLAIM_CODES=true` to accept fixed code `123`
+- Docs: `docs/WIRELESS_ONBOARDING.md`
+- Dashboard: open the web app, paste a bearer token, view devices/jobs/earnings and mint claim codes
