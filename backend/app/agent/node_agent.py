@@ -18,9 +18,12 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from app.agent.benchmark import BenchmarkAborted, collect_telemetry, encode_results, run_benchmark
+from app.logging import get_logger
 from app.services.job_executor import execute_job
 
-logger = logging.getLogger(__name__)
+# structlog logger: the agent logs with keyword context (stdlib logging rejects kwargs).
+logger = get_logger(__name__)
 
 
 def sign_payload(private_key: ec.EllipticCurvePrivateKey, payload: dict[str, Any]) -> str:
@@ -134,16 +137,12 @@ class FarmosDeviceAgent:
             return False
 
         observed_at = datetime.now(timezone.utc).isoformat()
-        payload = {
+        # Real host telemetry only; unknown values are omitted (never faked) so the
+        # server's safety governor treats them conservatively.
+        payload: dict[str, Any] = {
             "observed_at": observed_at,
-            "battery_pct": 50.0,  # device should report real value
-            "charging": True,
-            "temperature_c": 35.0,
-            "cpu_util_pct": 10.0,
-            "ram_used_mb": 512,
-            "storage_free_mb": 10000,
-            "network": {"type": "wifi", "down_mbps": 100, "up_mbps": 50},
-            "app_version": "1.0.0",
+            **collect_telemetry(),
+            "app_version": "1.1.0",
             "request_nonce": uuid4().hex,
             "request_timestamp": observed_at,
         }
@@ -158,11 +157,54 @@ class FarmosDeviceAgent:
             json=payload,
         )
         if resp.status_code == 200:
-            logger.info("heartbeat_ok", device_id=self.device_id)
+            body = resp.json()
+            self.last_safety = body.get("safety") or {}
+            self.benchmark_required = bool(body.get("benchmark_required"))
+            logger.info("heartbeat_ok", device_id=self.device_id, status=body.get("status"),
+                        safety=self.last_safety)
             return True
         else:
             logger.warning("heartbeat_failed", status=resp.status_code, body=resp.text[:200])
             return False
+
+    def safety_paused(self) -> bool:
+        """Local defense in depth: obey the server's safety decision."""
+        s = getattr(self, "last_safety", {}) or {}
+        return bool(s.get("paused") or s.get("emergency_stop"))
+
+    async def submit_benchmark(self, client: httpx.AsyncClient, job_id: str | None = None) -> bool:
+        """Run suite farmos-bench-1 locally and submit the signed raw results."""
+        try:
+            raw = await asyncio.to_thread(run_benchmark, self.api_base)
+        except BenchmarkAborted as exc:
+            logger.warning("benchmark_aborted", reason=str(exc))
+            return False
+        raw_json, sha = encode_results(raw)
+        body: dict[str, Any] = {
+            "suite_version": "farmos-bench-1",
+            "job_id": job_id,
+            "raw_results_json": raw_json,
+            "results_sha256": sha,
+            "request_nonce": uuid4().hex,
+            "request_timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        signed = {
+            "request_nonce": body["request_nonce"],
+            "request_timestamp": body["request_timestamp"],
+            "device_id": self.device_id,
+            "suite_version": body["suite_version"],
+            "job_id": job_id or "",
+            "results_sha256": sha,
+        }
+        body["signature"] = sign_payload(self.private_key, signed)
+        resp = await client.post(
+            f"{self.api_base}/api/v1/devices/{self.device_id}/benchmark/result",
+            headers={"Authorization": f"Bearer {self.node_token}"},
+            json=body,
+        )
+        ok = resp.status_code == 200
+        logger.info("benchmark_submitted", ok=ok, status=resp.status_code, body=resp.text[:300])
+        return ok
 
     async def heartbeat_once(self) -> bool:
         """Send one heartbeat."""
@@ -340,11 +382,29 @@ class FarmosDeviceAgent:
                     if not hb_ok:
                         logger.warning("heartbeat_failed", device_id=self.device_id)
 
+                    if self.safety_paused():
+                        logger.warning("safety_paused", safety=getattr(self, "last_safety", {}))
+                        await self._sleep_with_backoff()
+                        if once:
+                            break
+                        continue
+
+                    if getattr(self, "benchmark_required", False):
+                        await self.submit_benchmark(client)
+
                     # Poll for job
                     job_data = await self.poll_next_job(client)
                     if job_data and job_data.get("job"):
                         job = job_data["job"]
                         job_id = job["job_id"]
+
+                        if job.get("workload_type") == "benchmark":
+                            if await self.accept_job(client, job_id):
+                                await self.submit_benchmark(client, job_id)
+                            await self._sleep_with_backoff()
+                            if once:
+                                break
+                            continue
 
                         # Accept job
                         accept_ok = await self.accept_job(client, job_id)

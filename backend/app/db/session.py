@@ -13,15 +13,20 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    pool_size=settings.DATABASE_POOL_SIZE,
-    max_overflow=settings.DATABASE_MAX_OVERFLOW,
-    pool_timeout=settings.DATABASE_POOL_TIMEOUT,
-    pool_pre_ping=True,
-    echo=settings.APP_DEBUG,
-    poolclass=NullPool if settings.APP_ENV == "test" else None,
-)
+_engine_kwargs: dict = {"pool_pre_ping": True, "echo": settings.APP_DEBUG}
+if settings.APP_ENV == "test":
+    # NullPool rejects pool sizing kwargs; tests use a fresh connection per session
+    # so TestClient event loops never share pooled asyncpg connections.
+    _engine_kwargs["poolclass"] = NullPool
+else:
+    _engine_kwargs.update(
+        pool_size=settings.DATABASE_POOL_SIZE,
+        max_overflow=settings.DATABASE_MAX_OVERFLOW,
+        pool_timeout=settings.DATABASE_POOL_TIMEOUT,
+    )
+
+engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
+
 
 AsyncSessionLocal = async_sessionmaker(
     engine,

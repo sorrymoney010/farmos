@@ -5,17 +5,27 @@ from __future__ import annotations
 import secrets
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.models.core import Provider
 from app.db.models.devices import Device, DeviceCapability, DeviceHeartbeat
-from app.db.models.enums import DeviceStatus, RoleName
+from app.db.models.enums import (
+    DeviceStatus,
+    JobEventActorType,
+    JobStatus,
+    JobType,
+    RoleName,
+)
+from app.db.models.jobs_ledger import Job, JobAssignment, JobEvent, JobVerification
+from app.services import benchmark_service as bench_svc
+from app.services.device_safety import dispatch_block_reason
 from app.db.session import get_db
 from app.dependencies import get_current_user, require_roles
 from app.logging import get_logger
@@ -70,9 +80,36 @@ class HeartbeatRequest(BaseModel):
     storage_free_mb: int | None = None
     network: dict[str, Any] | None = None
     app_version: str | None = None
+    # Sprint 3 safety telemetry (all optional / backward compatible).
+    battery_health: str | None = Field(default=None, max_length=50)
+    battery_temperature_c: float | None = None
+    thermal_status: int | None = Field(default=None, ge=0, le=6)
     request_nonce: str
     request_timestamp: str
     signature: str
+
+
+class BenchmarkResultRequest(BaseModel):
+    """Signed benchmark result (suite farmos-bench-1).
+
+    ``raw_results_json`` is the exact JSON string the device produced; the device
+    signs its SHA-256 (``results_sha256``) so float formatting can never break
+    signature verification between Kotlin and Python.
+    Signed canonical payload: {request_nonce, request_timestamp, device_id,
+    suite_version, job_id ("" if none), results_sha256}.
+    """
+
+    suite_version: str = Field(min_length=1, max_length=50)
+    job_id: str | None = None
+    raw_results_json: str = Field(min_length=2, max_length=200_000)
+    results_sha256: str = Field(min_length=64, max_length=64)
+    request_nonce: str
+    request_timestamp: str
+    signature: str
+
+
+class BenchmarkRequest(BaseModel):
+    suite_version: str | None = None
 
 
 @router.post("/enrollment-token")
@@ -278,9 +315,12 @@ async def post_heartbeat(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
 
     try:
+        # Sign-what-you-send: verify over the fields the device actually sent
+        # (exclude_unset), so newer optional telemetry fields never break older
+        # clients' signatures and nothing unsigned is ever trusted.
         verify_request_signature(
             device.public_key,
-            req.model_dump(mode="json", exclude={"signature"}),
+            req.model_dump(mode="json", exclude={"signature"}, exclude_unset=True),
             req.signature,
         )
     except ValueError as exc:
@@ -301,25 +341,244 @@ async def post_heartbeat(
         down_mbps=network.get("down_mbps"),
         up_mbps=network.get("up_mbps"),
         app_version=req.app_version,
-        event_metadata=network,
+        event_metadata={
+            **network,
+            "battery_health": req.battery_health,
+            "battery_temperature_c": req.battery_temperature_c,
+            "thermal_status": req.thermal_status,
+        },
     )
     db.add(hb)
 
-    new_status = device.status
-    if device.status in {DeviceStatus.ENROLLING, DeviceStatus.BENCHMARKING, DeviceStatus.IDLE, DeviceStatus.OFFLINE}:
-        new_status = DeviceStatus.ACTIVE
-
-    await db.execute(
-        update(Device)
-        .where(Device.id == device.id)
-        .values(
-            last_seen_at=datetime.now(timezone.utc),
-            enrolled_at=device.enrolled_at or datetime.now(timezone.utc),
-            status=new_status,
+    # Lifecycle: onboarding/offline nodes come online. BENCHMARKING only leaves
+    # via a passing benchmark when BENCHMARK_REQUIRED_FOR_ACTIVE (spec §8).
+    promotable = {DeviceStatus.ENROLLING, DeviceStatus.IDLE, DeviceStatus.OFFLINE}
+    if not settings.BENCHMARK_REQUIRED_FOR_ACTIVE:
+        promotable.add(DeviceStatus.BENCHMARKING)
+    if device.status in promotable:
+        device.status = (
+            DeviceStatus.BENCHMARKING
+            if device.status == DeviceStatus.ENROLLING and settings.BENCHMARK_REQUIRED_FOR_ACTIVE
+            else DeviceStatus.ACTIVE
         )
+
+    # Thermal / battery governor — protect hardware (spec §10).
+    decision = await bench_svc.apply_heartbeat_safety(
+        db,
+        device,
+        temperature_c=req.temperature_c,
+        battery_pct=req.battery_pct,
+        charging=req.charging,
+        battery_health=req.battery_health,
+        battery_temperature_c=req.battery_temperature_c,
+        thermal_status=req.thermal_status,
     )
+    device.last_seen_at = datetime.now(timezone.utc)
+    device.enrolled_at = device.enrolled_at or datetime.now(timezone.utc)
+    new_status = device.status
+    benchmark_required = device.status == DeviceStatus.BENCHMARKING
+    farm_score = float(device.farm_score) if device.farm_score is not None else None
     await db.commit()
-    return {"detail": "heartbeat accepted", "device_id": device_id, "status": new_status.value}
+    return {
+        "detail": "heartbeat accepted",
+        "device_id": device_id,
+        "status": new_status.value,
+        "farm_score": farm_score,
+        "benchmark_required": benchmark_required,
+        "benchmark_suite_version": settings.BENCHMARK_SUITE_VERSION,
+        "safety": decision.to_response(),
+    }
+
+
+async def _authenticated_device(
+    device_id: str,
+    credentials: HTTPAuthorizationCredentials | None,
+    db: AsyncSession,
+) -> Device:
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Node token required")
+    token_payload = verify_node_token(credentials.credentials)
+    if not token_payload:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token")
+    if token_payload.get("sub") != device_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Node token/device mismatch")
+    device = (await db.execute(select(Device).where(Device.id == device_id))).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    return device
+
+
+@router.post("/{device_id}/benchmark/result")
+async def post_benchmark_result(
+    device_id: str,
+    req: BenchmarkResultRequest,
+    credentials: HTTPAuthorizationCredentials | None = Depends(node_bearer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Device submits a signed benchmark result; server scores it and updates FarmScore."""
+    device = await _authenticated_device(device_id, credentials, db)
+    try:
+        ensure_timestamp_fresh(req.request_timestamp, max_skew_seconds=settings.NODE_REQUEST_MAX_SKEW_SECONDS)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    signed = {
+        "request_nonce": req.request_nonce,
+        "request_timestamp": req.request_timestamp,
+        "device_id": device_id,
+        "suite_version": req.suite_version,
+        "job_id": req.job_id or "",
+        "results_sha256": req.results_sha256,
+    }
+    try:
+        verify_request_signature(device.public_key, signed, req.signature)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
+    if not secrets.compare_digest(bench_svc.results_sha256(req.raw_results_json), req.results_sha256.lower()):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="results_sha256 mismatch")
+    nonce_ok = await mark_nonce_used(
+        f"benchmark:{device_id}", req.request_nonce, ttl_seconds=settings.NODE_REQUEST_MAX_SKEW_SECONDS
+    )
+    if not nonce_ok:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Replay detected")
+
+    if device.status in {DeviceStatus.QUARANTINED, DeviceStatus.SUSPENDED, DeviceStatus.RETIRED}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Device is {device.status.value}")
+    try:
+        raw = bench_svc.parse_raw_results(req.raw_results_json)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid raw results: {exc}")
+
+    job: Job | None = None
+    if req.job_id:
+        try:
+            job_uuid = UUID(req.job_id)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id")
+        job = (
+            await db.execute(
+                select(Job).join(JobAssignment).where(
+                    Job.id == job_uuid,
+                    JobAssignment.device_id == device.id,
+                    Job.workload_type == JobType.BENCHMARK.value,
+                    Job.status.in_([JobStatus.DISPATCHED, JobStatus.ACCEPTED, JobStatus.RUNNING]),
+                )
+            )
+        ).scalar_one_or_none()
+        if job is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Benchmark job not found for device")
+
+    benchmark, passed, reasons = await bench_svc.record_result(
+        db, device, req.suite_version, raw, job_id=job.id if job else None
+    )
+
+    if job is not None:
+        now = datetime.now(timezone.utc)
+        prev = job.status
+        # Benchmarks are internal: VERIFIED as recorded, never revenue/ledger credit.
+        for frm, to in ((prev, JobStatus.RESULT_SUBMITTED), (JobStatus.RESULT_SUBMITTED, JobStatus.VERIFIED)):
+            db.add(JobEvent(job_id=job.id, from_status=frm.value, to_status=to.value,
+                            actor_type=JobEventActorType.NODE if to == JobStatus.RESULT_SUBMITTED
+                            else JobEventActorType.SYSTEM,
+                            actor_id=device.id if to == JobStatus.RESULT_SUBMITTED else None,
+                            reason="benchmark recorded"))
+        job.status = JobStatus.VERIFIED
+        job.updated_at = now
+        db.add(JobVerification(
+            job_id=job.id, status="PASSED" if passed else "FAILED", method="benchmark_recorded",
+            evidence={"benchmark_id": str(benchmark.id), "results_sha256": req.results_sha256,
+                      "farm_score": float(benchmark.farm_score), "baseline_failures": reasons},
+            verified_at=now,
+        ))
+        if device.status == DeviceStatus.RUNNING:
+            device.status = DeviceStatus.IDLE
+
+    await db.commit()
+    logger.info("benchmark_recorded", device_id=device_id, farm_score=float(benchmark.farm_score), passed=passed)
+    return {
+        **bench_svc.benchmark_to_dict(benchmark),
+        "device_id": device_id,
+        "status": device.status.value,
+    }
+
+
+@router.post("/{device_id}/benchmark")
+async def request_benchmark(
+    device_id: str,
+    payload: BenchmarkRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles(RoleName.OWNER, RoleName.ADMIN, RoleName.OPERATIONS)),
+):
+    """Create + dispatch a benchmark job to a device (BenchmarkService.request_benchmark)."""
+    device = (await db.execute(select(Device).where(Device.id == device_id))).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    thresholds = await bench_svc.thresholds_for_device(db, device)
+    blocked = dispatch_block_reason(device, JobType.BENCHMARK.value, thresholds, datetime.now(timezone.utc))
+    if blocked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Benchmark blocked by safety policy: {blocked}")
+
+    suite = (payload.suite_version if payload else None) or settings.BENCHMARK_SUITE_VERSION
+    now = datetime.now(timezone.utc)
+    job = Job(
+        workload_type=JobType.BENCHMARK.value,
+        status=JobStatus.DISPATCHED,
+        priority=10,
+        requested_resources={"suite_version": suite, "max_runtime_seconds": 120},
+        adapter_id="internal",
+        customer_id=current_user.id,
+        max_runtime_seconds=120,
+    )
+    db.add(job)
+    await db.flush()
+    db.add(JobAssignment(job_id=job.id, device_id=device.id, assigned_at=now))
+    db.add(JobEvent(job_id=job.id, from_status=None, to_status=JobStatus.CREATED.value,
+                    actor_type=JobEventActorType.USER, actor_id=current_user.id))
+    db.add(JobEvent(job_id=job.id, from_status=JobStatus.CREATED.value, to_status=JobStatus.DISPATCHED.value,
+                    actor_type=JobEventActorType.SYSTEM, reason="benchmark requested"))
+    await db.commit()
+    return {"job_id": str(job.id), "device_id": device_id, "suite_version": suite,
+            "status": JobStatus.DISPATCHED.value}
+
+
+@router.get("/{device_id}/benchmarks")
+async def list_benchmarks(
+    device_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    from app.db.models.devices import DeviceBenchmark
+
+    device = (await db.execute(select(Device).where(Device.id == device_id))).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    rows = (
+        await db.execute(
+            select(DeviceBenchmark)
+            .where(DeviceBenchmark.device_id == device.id)
+            .order_by(DeviceBenchmark.completed_at.desc())
+            .limit(20)
+        )
+    ).scalars().all()
+    return {"device_id": device_id, "farm_score": _f(device.farm_score),
+            "benchmarks": [bench_svc.benchmark_to_dict(b) for b in rows]}
+
+
+def _f(v: Any) -> float | None:
+    return float(v) if v is not None else None
+
+
+def device_health_dict(device: Device) -> dict[str, Any]:
+    return {
+        "temperature_state": device.temperature_state or "UNKNOWN",
+        "temperature_c": _f(device.last_temperature_c),
+        "battery_pct": _f(device.last_battery_pct),
+        "charging": device.last_charging,
+        "battery_health": device.battery_health,
+        "safety_paused": bool(device.safety_paused),
+        "safety_reason": device.safety_reason,
+        "cooldown_until": device.cooldown_until.isoformat() if device.cooldown_until else None,
+    }
 
 
 @router.get("/{device_id}")
@@ -332,11 +591,15 @@ async def get_device(
     device = result.scalar_one_or_none()
     if not device:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    latest = await bench_svc.get_latest_scores(db, device.id)
     return {
         "device_id": str(device.id),
         "human_id": device.human_id,
         "status": device.status.value,
-        "farm_score": device.farm_score,
+        "model": device.model,
+        "farm_score": _f(device.farm_score),
         "reputation_score": float(device.reputation_score) if device.reputation_score is not None else None,
         "last_seen_at": device.last_seen_at.isoformat() if device.last_seen_at else None,
+        "health": device_health_dict(device),
+        "latest_benchmark": bench_svc.benchmark_to_dict(latest) if latest else None,
     }

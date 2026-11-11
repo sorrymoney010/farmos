@@ -46,7 +46,13 @@ async def admin_fleet(
                 "device_id": str(d.id),
                 "human_id": d.human_id,
                 "status": d.status.value,
-                "farm_score": d.farm_score,
+                "farm_score": float(d.farm_score) if d.farm_score is not None else None,
+                "temperature_state": d.temperature_state or "UNKNOWN",
+                "temperature_c": float(d.last_temperature_c) if d.last_temperature_c is not None else None,
+                "battery_pct": float(d.last_battery_pct) if d.last_battery_pct is not None else None,
+                "charging": d.last_charging,
+                "safety_paused": bool(d.safety_paused),
+                "safety_reason": d.safety_reason,
                 "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
             }
             for d in devices
@@ -109,7 +115,14 @@ async def release_quarantine(
     device = result.scalar_one_or_none()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    if device.status != DeviceStatus.QUARANTINED:
+        raise HTTPException(status_code=409, detail=f"Device is not quarantined (status={device.status.value})")
+    # Explicit admin release (spec §60: QUARANTINED -> ACTIVE only via explicit release).
+    # Safety state is reset; the next heartbeat re-evaluates thermal/battery policy.
     device.status = DeviceStatus.IDLE
+    device.safety_paused = False
+    device.safety_reason = None
+    device.cooldown_until = None
     event = DeviceHealthEvent(
         device_id=device.id,
         event_type="RELEASE_QUARANTINE",
@@ -171,3 +184,83 @@ async def admin_health():
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ── Sprint 3: FarmScore weights + thermal/battery safety policy ─────────────
+
+class FarmScoreWeightsRequest(BaseModel):
+    weights: dict[str, float]
+    recalculate: bool = True
+
+
+@router.get("/farmscore/weights")
+async def get_farmscore_weights(
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS")),
+):
+    from app.services import benchmark_service as bench_svc
+    from app.services.farm_score import COMPONENTS, SUITE_VERSION
+
+    return {"weights": await bench_svc.get_weights(db), "components": list(COMPONENTS),
+            "suite_version": SUITE_VERSION}
+
+
+@router.put("/farmscore/weights")
+async def put_farmscore_weights(
+    req: FarmScoreWeightsRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles("OWNER", "ADMIN")),
+):
+    from app.services import benchmark_service as bench_svc
+
+    try:
+        weights = await bench_svc.set_weights(db, req.weights, current_user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    await db.flush()
+    recalculated = await bench_svc.recalculate_all_farm_scores(db) if req.recalculate else 0
+    db.add(AuditLog(
+        event_type=AuditEventType.SETTINGS_CHANGED, actor_type="USER", actor_id=current_user.id,
+        target_type="system_settings", event_metadata={"key": bench_svc.WEIGHTS_KEY, "weights": weights},
+    ))
+    await db.commit()
+    return {"weights": weights, "devices_recalculated": recalculated}
+
+
+class SafetyPolicyRequest(BaseModel):
+    default: dict[str, float] = {}
+    models: dict[str, dict[str, float]] = {}
+
+
+@router.get("/safety/policy")
+async def get_safety_policy(
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS")),
+):
+    from app.config import settings
+    from app.services import benchmark_service as bench_svc
+    from app.services.device_safety import thresholds_from_settings
+
+    policy = await bench_svc.get_safety_policy(db)
+    return {"policy": policy or {}, "effective_default": thresholds_from_settings(settings, None, policy).as_dict()}
+
+
+@router.put("/safety/policy")
+async def put_safety_policy(
+    req: SafetyPolicyRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles("OWNER", "ADMIN")),
+):
+    from app.services import benchmark_service as bench_svc
+
+    policy = req.model_dump()
+    try:
+        effective = await bench_svc.set_safety_policy(db, policy, current_user.id)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid safety policy: {exc}")
+    db.add(AuditLog(
+        event_type=AuditEventType.SETTINGS_CHANGED, actor_type="USER", actor_id=current_user.id,
+        target_type="system_settings", event_metadata={"key": bench_svc.SAFETY_POLICY_KEY, "policy": policy},
+    ))
+    await db.commit()
+    return {"policy": policy, "effective_default": effective.as_dict()}

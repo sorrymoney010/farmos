@@ -3,7 +3,12 @@ package com.farmos.node.job
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import com.farmos.node.benchmark.BenchmarkRepository
+import com.farmos.node.benchmark.BenchmarkRunner
 import com.farmos.node.identity.DeviceIdentityStore
+import com.farmos.node.safety.DeviceTelemetry
+import com.farmos.node.safety.NodeSafetyState
+import com.farmos.node.safety.ThermalGovernor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,6 +26,11 @@ import kotlin.random.Random
 object JobLoop {
     private const val BASE_POLL_MS = 10_000L
     private const val MAX_BACKOFF_MS = 60_000L
+    private const val SAFETY_PAUSE_MS = 30_000L
+    private const val AUTO_BENCHMARK_RETRY_MS = 10 * 60_000L
+
+    @Volatile
+    private var lastAutoBenchmarkMs = 0L
 
     private var job: Job? = null
     @Volatile
@@ -51,11 +61,42 @@ object JobLoop {
                     delay(BASE_POLL_MS)
                     continue
                 }
+                // ── Local safety gate (defense in depth; spec §10) ──
+                val snap = runCatching { DeviceTelemetry.read(appCtx) }.getOrNull()
+                if (snap != null) NodeSafetyState.lastSnapshot = snap
+                val decision = NodeSafetyState.decide()
+                if (decision.workloadClass == ThermalGovernor.WorkloadClass.NONE) {
+                    updateStatus("Jobs: PAUSED (${decision.band}) · ${decision.reason ?: "safety"}")
+                    delay(SAFETY_PAUSE_MS)
+                    continue
+                }
                 try {
+                    // Initial baseline benchmark (spec §8: node is ACTIVE only after it passes).
+                    val now = System.currentTimeMillis()
+                    if (NodeSafetyState.benchmarkRequired && now - lastAutoBenchmarkMs > AUTO_BENCHMARK_RETRY_MS &&
+                        decision.allows("benchmark")
+                    ) {
+                        lastAutoBenchmarkMs = now
+                        updateStatus("Benchmark: running farmos-bench-1…")
+                        val res = BenchmarkRepository(appCtx, store).runAndSubmit()
+                        NodeSafetyState.benchmarkRequired = false
+                        updateStatus("Benchmark: FarmScore ${res.optDouble("farm_score")} · ${res.optString("status")}")
+                    }
+
                     val repo = JobRepository(appCtx, store)
                     val polled = repo.pollNextJob()
                     if (polled == null) {
                         updateStatus("Jobs: idle (no work) · last ok")
+                        backoffMs = BASE_POLL_MS
+                    } else if (!decision.allows(polled.workloadType)) {
+                        // Leave it DISPATCHED on the server; pick it up once cooler.
+                        updateStatus("Jobs: holding ${polled.workloadType} (${decision.band}: ${decision.reason})")
+                        backoffMs = SAFETY_PAUSE_MS
+                    } else if (polled.workloadType.equals("benchmark", ignoreCase = true)) {
+                        updateStatus("Benchmark job ${polled.jobId.take(8)}…")
+                        repo.acceptJob(polled.jobId)
+                        val res = BenchmarkRepository(appCtx, store).runAndSubmit(polled.jobId)
+                        updateStatus("Benchmark: FarmScore ${res.optDouble("farm_score")}")
                         backoffMs = BASE_POLL_MS
                     } else {
                         updateStatus("Jobs: accept ${polled.jobId.take(8)}… (${polled.workloadType})")
@@ -73,6 +114,11 @@ object JobLoop {
                         updateStatus(hint)
                         backoffMs = BASE_POLL_MS
                     }
+                } catch (e: BenchmarkRunner.Aborted) {
+                    android.util.Log.w("FarmosJob", "Benchmark aborted: ${e.message}")
+                    updateStatus("Benchmark: aborted · ${e.message?.take(80)}")
+                    NodeSafetyState.noteRed()
+                    backoffMs = SAFETY_PAUSE_MS
                 } catch (e: Exception) {
                     android.util.Log.e("FarmosJob", "JobLoop error", e)
                     updateStatus("Jobs: error ${e.message?.take(80) ?: e.javaClass.simpleName}")

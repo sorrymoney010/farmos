@@ -46,3 +46,7 @@ ehthumbs.db
 services/farmos-acurast-compute/.acurast/
 services/*.DS_Store
 
+
+# web build artifacts
+web/node_modules/
+web/.next/

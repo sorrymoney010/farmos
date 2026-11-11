@@ -14,6 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db.models.enums import (
@@ -38,6 +39,8 @@ from app.db.session import get_db
 from app.dependencies import get_current_user, require_roles
 from app.logging import get_logger
 from app.security.node_auth import verify_node_token, verify_request_signature, ensure_timestamp_fresh
+from app.services import benchmark_service as bench_svc
+from app.services.device_safety import SCHEDULABLE_STATUSES, dispatch_block_reason
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -170,7 +173,10 @@ async def get_job(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS", "CUSTOMER")),
 ):
-    result = await db.execute(select(Job).where(Job.id == job_id))
+    # Eager-load the assignment: lazy loading is not allowed under asyncio.
+    result = await db.execute(
+        select(Job).options(selectinload(Job.assignment)).where(Job.id == job_id)
+    )
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
@@ -227,10 +233,13 @@ async def dispatch_job(
     device = device_result.scalar_one_or_none()
     if not device:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
-    if device.status != DeviceStatus.ACTIVE:
+    # Coder rule §53.9: no device job without policy check (status + thermal + battery).
+    thresholds = await bench_svc.thresholds_for_device(db, device)
+    blocked = dispatch_block_reason(device, job.workload_type, thresholds, datetime.now(timezone.utc))
+    if blocked:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Device not active (status={device.status.value})",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Dispatch blocked by safety policy: {blocked}",
         )
 
     # Create assignment
@@ -326,6 +335,20 @@ async def device_poll_next_job(
     if not job:
         return {"job": None, "device_id": str(device.id), "status": device.status.value}
 
+    # Defense in depth: never hand out work a device must not run right now
+    # (e.g. it overheated after dispatch). The job stays DISPATCHED for later.
+    thresholds = await bench_svc.thresholds_for_device(db, device)
+    blocked = dispatch_block_reason(device, job.workload_type, thresholds, datetime.now(timezone.utc))
+    if blocked:
+        return {
+            "job": None,
+            "paused": True,
+            "reason": blocked,
+            "retry_after_seconds": 30,
+            "device_id": str(device.id),
+            "status": device.status.value,
+        }
+
     # Parse payload
     payload: dict[str, Any] = {}
     if job.requested_resources:
@@ -399,6 +422,7 @@ async def device_accept_job(
     # Find job assignment
     job_q = await db.execute(
         select(Job)
+        .options(selectinload(Job.assignment))
         .join(JobAssignment)
         .where(
             Job.id == job_id,
@@ -409,6 +433,11 @@ async def device_accept_job(
     job = job_q.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found or not assigned to this device")
+
+    thresholds = await bench_svc.thresholds_for_device(db, device)
+    blocked = dispatch_block_reason(device, job.workload_type, thresholds, datetime.now(timezone.utc))
+    if blocked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Accept blocked by safety policy: {blocked}")
 
     # Mark accepted
     await db.execute(
@@ -432,10 +461,11 @@ async def device_accept_job(
     )
     db.add(event)
 
-    # Update device status to RUNNING
+    # Update device status to RUNNING (only from schedulable states; a
+    # BENCHMARKING node keeps its onboarding status while it benchmarks).
     await db.execute(
         update(Device)
-        .where(Device.id == device_id)
+        .where(Device.id == device_id, Device.status.in_(list(SCHEDULABLE_STATUSES)))
         .values(status=DeviceStatus.RUNNING, updated_at=datetime.now(timezone.utc))
     )
 
@@ -503,6 +533,7 @@ async def device_submit_result(
     # Find job
     job_q = await db.execute(
         select(Job)
+        .options(selectinload(Job.assignment))
         .join(JobAssignment)
         .where(
             Job.id == job_id,
@@ -574,7 +605,7 @@ async def verify_and_credit_result(
     After real customer payment is verified, call with is_real_revenue=True
     to credit the device's REAL earnings ledger.
     """
-    job_q = await db.execute(select(Job).where(Job.id == req.job_id))
+    job_q = await db.execute(select(Job).options(selectinload(Job.assignment)).where(Job.id == req.job_id))
     job = job_q.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
@@ -639,9 +670,11 @@ async def verify_and_credit_result(
 
     # Update device status back to ACTIVE if it was RUNNING
     if job.assignment:
+        # Only release RUNNING -> ACTIVE; never override COOLING/THROTTLED/QUARANTINED
+        # set by the safety governor while the job was in flight.
         await db.execute(
             update(Device)
-            .where(Device.id == job.assignment.device_id)
+            .where(Device.id == job.assignment.device_id, Device.status == DeviceStatus.RUNNING)
             .values(status=DeviceStatus.ACTIVE, updated_at=datetime.now(timezone.utc))
         )
         await db.commit()

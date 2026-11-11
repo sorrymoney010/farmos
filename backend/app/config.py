@@ -85,4 +85,39 @@ class Settings(BaseSettings):
     CLAIM_CODE_EXPIRE_MINUTES: int = 15
 
 
+    # ── Sprint 3: Benchmarks / FarmScore (spec §9, §57.2) ───────────────────
+    # Suite version every score references; FarmScore must be reproducible.
+    BENCHMARK_SUITE_VERSION: str = "farmos-bench-1"
+    # Spec §9 recommended initial weights. Admin can override at runtime via
+    # PUT /api/v1/admin/farmscore/weights (stored in system_settings).
+    FARMSCORE_WEIGHTS: dict[str, float] = {
+        "cpu": 0.20,
+        "ai": 0.15,
+        "memory": 0.10,
+        "storage": 0.10,
+        "network": 0.15,
+        "thermal": 0.10,
+        "power_efficiency": 0.10,
+        "reliability": 0.10,
+    }
+    # Spec §8: node becomes ACTIVE only after passing baseline health checks.
+    BENCHMARK_REQUIRED_FOR_ACTIVE: bool = True
+    BENCHMARK_MIN_FARM_SCORE: float = 10.0
+
+    # ── Thermal + hardware safety (spec §10, §76) — protect hardware ────────
+    THERMAL_GREEN_MAX_C: float = 38.0   # < 38 normal
+    THERMAL_YELLOW_MAX_C: float = 42.0  # 38–42 reduce concurrency
+    THERMAL_ORANGE_MAX_C: float = 45.0  # 42–45 light workloads only; > 45 RED stop + cool
+    THERMAL_EMERGENCY_C: float = 50.0   # emergency stop of everything on the node
+    THERMAL_COOLDOWN_SECONDS: int = 600  # per-device cooldown window after RED
+    THERMAL_RED_EVENTS_QUARANTINE: int = 3  # RED events within window -> quarantine
+    THERMAL_RED_WINDOW_SECONDS: int = 3600
+    # Battery policy (spec §10 + §68 runtime contract min_battery_pct=40)
+    BATTERY_MIN_PCT_DISCHARGING: float = 40.0
+    BATTERY_CRITICAL_PCT: float = 15.0
+    BATTERY_HEAVY_MIN_PCT_DISCHARGING: float = 60.0  # heavy work off-charger
+    # Per-model threshold overrides, e.g. {"SM-G991U": {"green_max": 37, ...}}
+    THERMAL_MODEL_OVERRIDES: dict[str, dict[str, float]] = {}
+
+
 settings = Settings()

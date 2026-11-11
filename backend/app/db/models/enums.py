@@ -82,6 +82,18 @@ class JobType(str, enum.Enum):
     API_REQUEST = "api_request"
     MONITOR = "monitor"
     DATA_TRANSFORM = "data_transform"
+    BENCHMARK = "benchmark"
+
+
+class TemperatureState(str, enum.Enum):
+    """Spec §10 thermal bands plus COOLING (post-RED cooldown window)."""
+
+    GREEN = "GREEN"
+    YELLOW = "YELLOW"
+    ORANGE = "ORANGE"
+    RED = "RED"
+    COOLING = "COOLING"
+    UNKNOWN = "UNKNOWN"
 
 
 class JobEventActorType(str, enum.Enum):
