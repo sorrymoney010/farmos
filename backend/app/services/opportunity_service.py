@@ -13,9 +13,10 @@ from typing import Any, Optional
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.adapters import registry
+from app.adapters import guard, registry
 from app.adapters.base import OpportunitySpec
 from app.config import settings
 from app.db.models.audit import AuditLog
@@ -72,16 +73,20 @@ async def set_policy_override(db: AsyncSession, value: dict[str, Any], user_id: 
 
 async def ensure_registry(db: AsyncSession, *, discover: bool = True) -> None:
     existing = {r.id: r for r in (await db.execute(select(RevenueAdapterRecord))).scalars().all()}
-    changed = False
     for a in registry.ADAPTERS.values():
         if a.id not in existing:
-            db.add(RevenueAdapterRecord(id=a.id, name=a.name, category=a.category, kind=a.kind,
-                                        simulated=a.simulated, enabled=True,
-                                        certification_stage=a.certification_stage, health_detail={},
-                                        last_reconcile={}))
-            changed = True
-    if changed:
-        await db.flush()
+            # concurrent first requests on a fresh DB race here: insert in a savepoint
+            # and treat a unique violation as "another request created it"
+            # (found by the Sprint 10 fleet load test)
+            try:
+                async with db.begin_nested():
+                    db.add(RevenueAdapterRecord(id=a.id, name=a.name, category=a.category, kind=a.kind,
+                                                simulated=a.simulated, enabled=True,
+                                                certification_stage=a.certification_stage, health_detail={},
+                                                last_reconcile={}))
+                    await db.flush()
+            except IntegrityError:
+                pass
     if discover:  # first run: seed every adapter's catalogue (all local / simulated; no network)
         seeded = {r[0] for r in (await db.execute(select(Opportunity.adapter_id).distinct())).all()}
         for aid in registry.ADAPTERS:
@@ -93,6 +98,17 @@ async def adapter_record(db: AsyncSession, adapter_id: str) -> Optional[RevenueA
     return (await db.execute(select(RevenueAdapterRecord).where(RevenueAdapterRecord.id == adapter_id))).scalar_one_or_none()
 
 
+def _schedulable(rec: Optional[RevenueAdapterRecord], external_paused: bool) -> bool:
+    """New jobs may be created / scheduled / dispatched for this adapter (spec §126, §139)."""
+    if rec is None or not rec.enabled:
+        return False
+    if guard.switch_on(rec, "DISABLE_SCHEDULING"):
+        return False
+    if rec.kind == "EXTERNAL" and external_paused:
+        return False
+    return True
+
+
 async def adapter_enabled(db: AsyncSession, adapter_id: str) -> bool:
     if adapter_id in registry.SYSTEM_ADAPTER_IDS:
         return True
@@ -100,12 +116,37 @@ async def adapter_enabled(db: AsyncSession, adapter_id: str) -> bool:
     if rec is None and adapter_id in registry.ADAPTERS:
         await ensure_registry(db, discover=False)
         rec = await adapter_record(db, adapter_id)
-    return bool(rec and rec.enabled)
+    return _schedulable(rec, await guard.external_paused(db))
 
 
 async def enabled_adapter_ids(db: AsyncSession) -> set[str]:
-    rows = (await db.execute(select(RevenueAdapterRecord.id).where(RevenueAdapterRecord.enabled.is_(True)))).all()
-    return {r[0] for r in rows} | registry.SYSTEM_ADAPTER_IDS
+    paused = await guard.external_paused(db)
+    rows = (await db.execute(select(RevenueAdapterRecord).where(RevenueAdapterRecord.enabled.is_(True)))).scalars().all()
+    return {r.id for r in rows if _schedulable(r, paused)} | registry.SYSTEM_ADAPTER_IDS
+
+
+async def earnings_release_block(db: AsyncSession, adapter_id: Optional[str],
+                                 _cache: Optional[dict[str, Optional[str]]] = None) -> Optional[str]:
+    """Spec §126: while an EXTERNAL adapter is disabled, globally paused or its last
+    reconciliation is not clean, its earnings must not be converted to AVAILABLE."""
+    if not adapter_id:
+        return None
+    if _cache is not None and adapter_id in _cache:
+        return _cache[adapter_id]
+    a = registry.get(adapter_id)
+    reason: Optional[str] = None
+    if a is not None and a.kind == "EXTERNAL":
+        rec = await adapter_record(db, adapter_id)
+        if rec is None or not rec.enabled:
+            reason = f"adapter {adapter_id} disabled (spec §126)"
+        elif await guard.external_paused(db):
+            reason = "PAUSE_EXTERNAL_ADAPTERS kill switch"
+        elif (rec.last_reconcile or {}).get("status") in ("MISMATCH", "ERROR"):
+            reason = (f"adapter {adapter_id} last reconciliation "
+                      f"{(rec.last_reconcile or {}).get('status')} (spec §126)")
+    if _cache is not None:
+        _cache[adapter_id] = reason
+    return reason
 
 
 async def set_adapter_enabled(db: AsyncSession, adapter_id: str, enabled: bool, reason: str | None,
@@ -115,6 +156,8 @@ async def set_adapter_enabled(db: AsyncSession, adapter_id: str, enabled: bool, 
     if rec is None:
         raise KeyError(adapter_id)
     rec.enabled = enabled
+    if enabled:  # an admin re-enable closes the circuit breaker
+        guard.reset_circuit(rec)
     rec.disabled_reason = None if enabled else (reason or "disabled by admin")
     rec.disabled_by = None if enabled else user_id
     rec.disabled_at = None if enabled else utcnow()
@@ -131,9 +174,12 @@ async def health_check(db: AsyncSession, adapter_id: str) -> dict[str, Any]:
     if adapter is None or rec is None:
         raise KeyError(adapter_id)
     try:
-        h = await adapter.health_check()
-    except Exception as exc:  # adapter failure must not crash admin
-        h = {"status": "ERROR", "error": str(exc)[:500]}
+        h = await guard.call(db, rec, "health_check", adapter.health_check)
+        if not isinstance(h, dict):
+            await guard.record_failure(db, rec, "health_check", f"returned {type(h).__name__}")
+            h = {"status": "ERROR", "error": "health_check returned a non-object"}
+    except guard.AdapterCallError as exc:  # adapter failure must not crash admin
+        h = {"status": "CIRCUIT_OPEN" if exc.short_circuited else "ERROR", "error": exc.detail[:500]}
     rec.health_status = str(h.get("status", "UNKNOWN"))
     rec.health_detail = h
     rec.last_health_at = utcnow()
@@ -162,7 +208,15 @@ async def reconcile(db: AsyncSession, adapter_id: str, user_id: UUID | None = No
         opp = (await db.execute(select(Opportunity).where(Opportunity.id == opp_id))).scalar_one_or_none() if opp_id else None
         per_job = float((opp.constraints or {}).get("reward_asset_per_job") or 0) if opp else 0.0
         expected += per_job * int(n)
-    res = await adapter.reconcile(expected)
+    try:
+        res = await guard.call(db, rec, "reconcile", lambda: adapter.reconcile(expected))
+    except guard.AdapterCallError as exc:
+        # an unreachable counterparty is not a clean reconciliation: record it so §126
+        # keeps that adapter's pending earnings from becoming AVAILABLE
+        out = {"status": "ERROR", "expected_asset": expected, "external_asset": None, "difference_asset": None,
+               "detail": exc.detail[:500], "simulated": rec.simulated, "at": utcnow().isoformat()}
+        rec.last_reconcile = out
+        return out
     out = {"status": res.status, "expected_asset": res.expected_asset, "external_asset": res.external_asset,
            "difference_asset": res.difference_asset, "detail": res.detail, "simulated": res.simulated,
            "at": utcnow().isoformat()}
@@ -171,6 +225,60 @@ async def reconcile(db: AsyncSession, adapter_id: str, user_id: UUID | None = No
         await set_adapter_enabled(db, adapter_id, False, f"auto: reconciliation mismatch {res.difference_asset:.6f}",
                                   user_id, actor_type="SYSTEM")
         out["auto_disabled"] = True
+    return out
+
+
+async def claim(db: AsyncSession, adapter_id: str, user_id: UUID | None = None,
+                now: Optional[datetime] = None) -> dict[str, Any]:
+    """Claim confirmed work from an adapter (simulated adapters return a SIMULATED
+    receipt; no network, no wallet). Refused while the adapter is disabled, its
+    DISABLE_CLAIMS switch is on, PAUSE_EXTERNAL_ADAPTERS is on, or its last
+    reconciliation is not clean. Uses a finalized_at watermark so work is never
+    claimed twice."""
+    from app.db.models.jobs_ledger import JobEconomics
+
+    adapter = registry.get(adapter_id)
+    rec = await adapter_record(db, adapter_id)
+    if adapter is None or rec is None:
+        raise KeyError(adapter_id)
+    now = now or utcnow()
+    if not rec.enabled:
+        raise ValueError("adapter disabled")
+    if guard.switch_on(rec, "DISABLE_CLAIMS"):
+        raise ValueError("DISABLE_CLAIMS is on for this adapter")
+    if rec.kind == "EXTERNAL" and await guard.external_paused(db):
+        raise ValueError("PAUSE_EXTERNAL_ADAPTERS kill switch is on")
+    if (rec.last_reconcile or {}).get("status") in ("MISMATCH", "ERROR"):
+        raise ValueError("last reconciliation is not clean; reconcile before claiming (spec §126)")
+    prev = dict(rec.last_claim or {})
+    q = (select(JobEconomics, Job.opportunity_id).join(Job, Job.id == JobEconomics.job_id)
+         .where(JobEconomics.adapter_id == adapter_id, JobEconomics.status == "ACTUAL",
+                JobEconomics.finalized_at.is_not(None), JobEconomics.finalized_at <= now)
+         .order_by(JobEconomics.finalized_at))
+    if prev.get("through"):
+        q = q.where(JobEconomics.finalized_at > datetime.fromisoformat(prev["through"]))
+    rows = (await db.execute(q)).all()
+    per_job: dict[Any, float] = {}
+    work = []
+    for econ, opp_id in rows:
+        if opp_id not in per_job:
+            opp = await get_opportunity(db, opp_id) if opp_id else None
+            per_job[opp_id] = float((opp.constraints or {}).get("reward_asset_per_job") or 0) if opp else 0.0
+        work.append({"job_id": str(econ.job_id), "amount_asset": per_job[opp_id]})
+    if not work:
+        return {"status": "NOTHING_TO_CLAIM", "jobs": 0, "simulated": rec.simulated}
+    try:
+        res = await guard.call(db, rec, "claim", lambda: adapter.claim(work), now=now)
+    except guard.AdapterCallError as exc:
+        return {"status": "ERROR", "error": exc.detail[:500], "jobs": len(work)}
+    through = max(e.finalized_at for e, _ in rows)
+    out = {"status": res.status, "jobs": len(work), "amount_asset": res.amount_asset, "asset": res.asset_symbol,
+           "fee_usd": res.fee_usd, "receipt_ref": res.receipt_id, "simulated": res.simulated,
+           "through": through.isoformat(), "at": now.isoformat(),
+           "claims_total": int(prev.get("claims_total") or 0) + 1}
+    rec.last_claim = out
+    db.add(AuditLog(event_type=AuditEventType.ADAPTER_CLAIMED, actor_type="ADMIN" if user_id else "SYSTEM",
+                    actor_id=user_id, target_type="ADAPTER", event_metadata={"adapter_id": adapter_id, **out}))
     return out
 
 
@@ -191,16 +299,41 @@ async def refresh_adapter(db: AsyncSession, adapter_id: str) -> list[Opportunity
     rec = await adapter_record(db, adapter_id)
     if rec is not None and not rec.enabled:
         return []  # killed adapters are not refreshed
-    specs = await adapter.discover()
-    out: list[Opportunity] = []
+    if rec is not None and guard.switch_on(rec, "DISABLE_DISCOVERY"):
+        return []
+    if rec is not None and rec.kind == "EXTERNAL" and await guard.external_paused(db):
+        return []
     now = utcnow()
-    for spec in specs:
+    if rec is None:
+        specs = await adapter.discover()
+    else:
+        try:
+            specs = await guard.call(db, rec, "discover", adapter.discover)
+        except guard.AdapterCallError as exc:
+            rec.health_detail = {**(rec.health_detail or {}), "last_discovery_error": exc.detail[:500]}
+            return []  # existing opportunities are retained unchanged
+    checked = guard.check_specs(specs)
+    if rec is not None:
+        rec.health_detail = {**(rec.health_detail or {}), "last_discovery": {
+            "at": now.isoformat(), "accepted": len(checked.accepted), "rejected": checked.rejected[:20],
+            "rejected_count": len(checked.rejected), "truncated": checked.truncated}}
+        if checked.rejected and not checked.accepted:
+            await guard.record_failure(db, rec, "discover", f"all {len(checked.rejected)} opportunities invalid")
+    out: list[Opportunity] = []
+    for spec in checked.accepted:
         opp = (await db.execute(select(Opportunity).where(
             Opportunity.adapter_id == adapter_id, Opportunity.external_id == spec.external_id))).scalar_one_or_none()
         if opp is None:
-            opp = Opportunity(adapter_id=adapter_id, external_id=spec.external_id, discovered_at=now,
-                              status=OpportunityStatus.ACTIVE)
-            db.add(opp)
+            try:  # race-safe first insert (uq_adapter_external), see ensure_registry
+                async with db.begin_nested():
+                    opp = Opportunity(adapter_id=adapter_id, external_id=spec.external_id, discovered_at=now,
+                                      status=OpportunityStatus.ACTIVE, name=spec.name, category=spec.category)
+                    db.add(opp)
+                    await db.flush()
+            except IntegrityError:
+                opp = (await db.execute(select(Opportunity).where(
+                    Opportunity.adapter_id == adapter_id, Opportunity.external_id == spec.external_id)
+                    .execution_options(populate_existing=True))).scalar_one()
         manually_disabled = opp.status == OpportunityStatus.DISABLED
         opp.name, opp.category, opp.workload_type = spec.name, spec.category, spec.workload_type
         opp.asset_symbol = spec.asset_symbol
@@ -224,7 +357,11 @@ async def refresh_adapter(db: AsyncSession, adapter_id: str) -> list[Opportunity
         opp.region_rules = opp.region_rules or {}
         await db.flush()
         if not manually_disabled:
-            v = await adapter.validate(opp)
+            try:
+                v = await adapter.validate(opp)
+            except Exception as exc:  # untrusted adapter code
+                from app.adapters.base import ValidationResult
+                v = ValidationResult(False, [f"validate() failed: {type(exc).__name__}: {str(exc)[:200]}"])
             opp.status = OpportunityStatus.ACTIVE if v.ok else OpportunityStatus.UNSCORABLE
             opp.disabled_reason = None if v.ok else "; ".join(v.reasons)
         out.append(opp)

@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_POOL_SIZE: int = 10
+    REDIS_POOL_TIMEOUT_SECONDS: float = 10.0   # wait for a free pooled connection before erroring
 
     # Security
     SECRET_KEY: str = Field(
@@ -156,6 +157,12 @@ class Settings(BaseSettings):
     SCHEDULER_AGING_PER_MINUTE: float = 1.0     # anti-starvation priority boost
     SCHEDULER_AGING_MAX: float = 200.0
     JOB_AUTO_SCHEDULE_DEFAULT: bool = True      # new jobs go CREATED->VALIDATED->QUEUED
+
+    # ── Sprint 10: external adapter hardening (spec §126, §127, §139) ─────────
+    ADAPTER_CALL_TIMEOUT_SECONDS: float = 10.0     # every adapter call is bounded
+    ADAPTER_CIRCUIT_FAILURE_THRESHOLD: int = 3     # consecutive failures -> circuit opens
+    ADAPTER_CIRCUIT_COOLDOWN_SECONDS: int = 300    # open circuit short-circuits calls
+    ADAPTER_MAX_OPPORTUNITIES: int = 200           # discovery output cap per adapter
 
     # ── Phase 3: profitability (spec §17, §64, §65) ──────────────────────────
     # All prices are configuration (no live market feeds, no external accounts).

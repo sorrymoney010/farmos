@@ -30,6 +30,20 @@ SIM_BALANCE_SHORTFALL = 0.0      # fraction of expected tokens the simulated cou
 RECONCILE_TOLERANCE = 0.01       # 1%
 CLAIM_FEE_USD = 0.02             # simulated per-claim chain fee
 JOBS_PER_CLAIM = 100
+# Test-only fault injection (Sprint 10 chaos tests): op name -> "error" | "timeout" | "garbage".
+# Never set in production code paths; module-level so tests can monkeypatch it.
+FAULT_MODE: dict[str, str] = {}
+FAULT_TIMEOUT_SLEEP_SECONDS = 30.0
+
+
+async def _fault(op: str) -> str | None:
+    mode = FAULT_MODE.get(op)
+    if mode == "error":
+        raise ConnectionError(f"simulated {op} outage")
+    if mode == "timeout":
+        import asyncio
+        await asyncio.sleep(FAULT_TIMEOUT_SLEEP_SECONDS)
+    return mode
 
 
 class AcurastSimAdapter(RevenueAdapter):
@@ -41,6 +55,11 @@ class AcurastSimAdapter(RevenueAdapter):
     certification_stage = "SANDBOX"
 
     async def discover(self) -> list[OpportunitySpec]:
+        if await _fault("discover") == "garbage":
+            return [OpportunitySpec(external_id="", name="x", category="c", workload_type="checksum"),
+                    OpportunitySpec(external_id="acu-bad", name="[SIM] bad", category="c", workload_type="checksum",
+                                    thermal_intensity=7.0, payment_confidence=float("nan"),
+                                    available_capacity=-5)]
         common = dict(asset_symbol="ACU", expected_payment_days=14, payment_confidence=0.6, risk_score=0.4,
                       chain_fee_usd_per_job=CLAIM_FEE_USD / JOBS_PER_CLAIM)
         return [
@@ -84,11 +103,13 @@ class AcurastSimAdapter(RevenueAdapter):
                        max_runtime_seconds=opportunity.expected_runtime_seconds)
 
     async def claim(self, confirmed_work: list[dict[str, Any]]) -> ClaimResult:
+        await _fault("claim")
         amount = sum(float(w.get("amount_asset", 0)) for w in confirmed_work)
         rid = "SIM-" + hashlib.sha256(repr(sorted(str(w.get("job_id")) for w in confirmed_work)).encode()).hexdigest()[:16]
         return ClaimResult("SIMULATED_CLAIMED", amount, "ACU", CLAIM_FEE_USD if confirmed_work else 0.0, rid, True)
 
     async def reconcile(self, expected_asset: float) -> ReconciliationResult:
+        await _fault("reconcile")
         external = expected_asset * (1 - SIM_BALANCE_SHORTFALL)
         diff = expected_asset - external
         ok = expected_asset == 0 or abs(diff) / expected_asset <= RECONCILE_TOLERANCE
@@ -96,6 +117,8 @@ class AcurastSimAdapter(RevenueAdapter):
                                     "simulated external balance", True)
 
     async def health_check(self) -> dict[str, Any]:
+        if await _fault("health_check") == "garbage":
+            return "ok"  # type: ignore[return-value]
         return {"status": "OK", "simulated": True, "note": "no external endpoint contacted"}
 
     async def get_constraints(self) -> dict[str, Any]:

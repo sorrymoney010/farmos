@@ -207,21 +207,32 @@ async def _opportunity_inflight(db: AsyncSession, opportunity_id) -> int:
         Job.opportunity_id == opportunity_id, Job.status.in_(INFLIGHT)))).scalar() or 0)
 
 
-async def _assign(db: AsyncSession, job: Job, row: dict[str, Any], now: datetime) -> bool:
-    """Transactional reserve + assign. Returns False on conflict (caller tries next device)."""
+ASSIGNED, JOB_GONE, DEVICE_UNAVAILABLE = "ASSIGNED", "JOB_GONE", "DEVICE_UNAVAILABLE"
+MAX_DEVICE_ATTEMPTS_PER_JOB = 8
+
+
+async def _assign(db: AsyncSession, job: Job, row: dict[str, Any], now: datetime) -> str:
+    """Transactional reserve + assign.
+
+    Row locks use SKIP LOCKED so concurrent ticks / pollers never queue behind each
+    other (no lock convoys, no deadlocks): a job locked elsewhere is being handled
+    by someone else (JOB_GONE); a device locked elsewhere is unavailable for this
+    tick (DEVICE_UNAVAILABLE). Found by the Sprint 10 fleet load test, where two
+    concurrent ticks over 500 jobs x 100 devices took ~125 s with blocking locks.
+    """
     # populate_existing: re-read the locked rows; never trust identity-map state.
-    device = (await db.execute(select(Device).where(Device.id == row["device"].id).with_for_update()
-                               .execution_options(populate_existing=True))).scalar_one_or_none()
-    locked = (await db.execute(select(Job).where(Job.id == job.id).with_for_update()
+    locked = (await db.execute(select(Job).where(Job.id == job.id).with_for_update(skip_locked=True)
                                .execution_options(populate_existing=True))).scalar_one_or_none()
     if locked is None or locked.status != JobStatus.QUEUED:
-        return False
+        return JOB_GONE
+    device = (await db.execute(select(Device).where(Device.id == row["device"].id).with_for_update(skip_locked=True)
+                               .execution_options(populate_existing=True))).scalar_one_or_none()
     if device is None or device.status not in SCHEDULABLE_STATUSES:
-        return False
+        return DEVICE_UNAVAILABLE
     active = int((await db.execute(select(func.count()).select_from(JobLease).where(
         JobLease.device_id == device.id, JobLease.status == leases.ACTIVE))).scalar() or 0)
     if active >= settings.MAX_CONCURRENT_JOBS_PER_DEVICE:
-        return False  # reservation conflict: someone else took the capacity
+        return DEVICE_UNAVAILABLE  # reservation conflict: someone else took the capacity
     est: prof.RevenueEstimate = row["estimate"]
     leases.add_event(db, job.id, JobStatus.QUEUED.value, JobStatus.MATCHED.value,
                      reason=(f"scheduler: device {device.human_id} score {row['score']:.6g} "
@@ -240,7 +251,7 @@ async def _assign(db: AsyncSession, job: Job, row: dict[str, Any], now: datetime
                                        "reputation": float(device.reputation_score or 0),
                                        "farm_score": float(device.farm_score) if device.farm_score is not None else None,
                                        "temperature_state": device.temperature_state})
-    return True
+    return ASSIGNED
 
 
 async def scheduler_tick(db: AsyncSession, now: datetime | None = None, *, limit: int | None = None,
@@ -309,26 +320,29 @@ async def scheduler_tick(db: AsyncSession, now: datetime | None = None, *, limit
             continue
 
         assigned = None
-        for row in ranked:
-            ok = False
+        by_id = {c.device.id: c for c in candidates}
+        for row in ranked[:MAX_DEVICE_ATTEMPTS_PER_JOB]:
+            outcome = JOB_GONE
             try:
                 async with db.begin_nested():  # savepoint: a conflict never expires other state
-                    ok = await _assign(db, job, row, now)
-                    if not ok:
+                    outcome = await _assign(db, job, row, now)
+                    if outcome != ASSIGNED:
                         raise _Conflict()
             except _Conflict:
-                ok = False
+                pass
             except Exception:
                 logger.exception("scheduler_assign_failed", job_id=jid)
                 await db.commit()
                 break
             await db.commit()  # persist the assignment / release row locks
-            if ok:
+            if outcome == ASSIGNED:
                 assigned = row
                 break
-            st = (await db.execute(select(Job.status).where(Job.id == job.id))).scalar()
-            if st != JobStatus.QUEUED:
-                break  # someone else dispatched it
+            if outcome == JOB_GONE:
+                break  # someone else dispatched / is dispatching it
+            c = by_id.get(row["device"].id)  # device taken elsewhere: skip it for the rest of this tick
+            if c is not None:
+                c.busy = max(c.busy, caps.max_per_device)
         if assigned is None:
             report["waiting"][jid] = "reservation conflict"
             continue

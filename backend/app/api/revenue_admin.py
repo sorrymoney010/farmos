@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.adapters import registry
+from app.adapters import guard, registry
 from app.db.models.devices import Device
 from app.db.models.enums import JobStatus
 from app.db.models.jobs_ledger import DeviceEconomics, Job, JobEconomics, RevenueAdapterRecord
@@ -27,6 +27,19 @@ READ = ("OWNER", "ADMIN", "OPERATIONS", "FINANCE")
 
 class ReasonRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
+
+
+class AdapterSwitchRequest(BaseModel):
+    name: str = Field(..., max_length=40)
+    enabled: bool
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class CertificationRequest(BaseModel):
+    stage: str = Field(..., max_length=40)
+    checklist: dict[str, bool | str | None] | None = None
+    economics: dict[str, float] | None = None
+    notes: str | None = Field(default=None, max_length=2000)
 
 
 class TickRequest(BaseModel):
@@ -50,6 +63,13 @@ def _adapter_dict(rec: RevenueAdapterRecord) -> dict[str, Any]:
         "certification_stage": rec.certification_stage, "health_status": rec.health_status,
         "health_detail": rec.health_detail or {}, "last_reconcile": rec.last_reconcile or {},
         "last_discovery_at": rec.last_discovery_at.isoformat() if rec.last_discovery_at else None,
+        "switches": guard.switches(rec),
+        "calls": {"total": int(rec.call_count or 0), "errors": int(rec.error_count or 0),
+                  "consecutive_failures": int(rec.consecutive_failures or 0), "last_error": rec.last_error,
+                  "last_error_at": rec.last_error_at.isoformat() if rec.last_error_at else None},
+        "circuit_open": guard.circuit_open(rec),
+        "circuit_open_until": rec.circuit_open_until.isoformat() if rec.circuit_open_until else None,
+        "certification": rec.certification or {}, "last_claim": rec.last_claim or {},
     }
 
 
@@ -71,7 +91,10 @@ async def list_adapters(db: AsyncSession = Depends(get_db), _=Depends(require_ro
     for r in rows:
         d = _adapter_dict(r)
         a = registry.get(r.id)
-        d["constraints"] = await a.get_constraints() if a else {}
+        try:
+            d["constraints"] = await guard.call(db, r, "get_constraints", a.get_constraints) if a else {}
+        except guard.AdapterCallError as exc:
+            d["constraints"] = {"error": exc.detail[:200]}
         out.append(d)
     await db.commit()
     return {"adapters": out, "system_adapters": sorted(registry.SYSTEM_ADAPTER_IDS)}
@@ -110,6 +133,80 @@ async def adapter_reconcile(adapter_id: str, db: AsyncSession = Depends(get_db),
     out = await opps.reconcile(db, adapter_id, current_user.id)
     await db.commit()
     return out
+
+
+@router.post("/adapters/{adapter_id}/switches")
+async def adapter_switch(adapter_id: str, req: AdapterSwitchRequest, db: AsyncSession = Depends(get_db),
+                         current_user=Depends(require_roles(*ADMIN))):
+    """Granular per-adapter kill switches (spec §139): DISABLE_DISCOVERY / DISABLE_SCHEDULING / DISABLE_CLAIMS."""
+    rec = await _rec(db, adapter_id)
+    try:
+        await guard.set_switch(db, rec, req.name.upper(), req.enabled, req.reason, current_user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    await db.commit()
+    return _adapter_dict(rec)
+
+
+@router.post("/adapters/{adapter_id}/discover")
+async def adapter_discover(adapter_id: str, db: AsyncSession = Depends(get_db), _=Depends(require_roles(*ADMIN))):
+    rec = await _rec(db, adapter_id)
+    opps_ = await opps.refresh_adapter(db, adapter_id)
+    await db.commit()
+    return {"adapter_id": adapter_id, "refreshed": len(opps_),
+            "last_discovery": (rec.health_detail or {}).get("last_discovery"),
+            "last_discovery_error": (rec.health_detail or {}).get("last_discovery_error"),
+            "adapter": _adapter_dict(rec)}
+
+
+@router.post("/adapters/{adapter_id}/claim")
+async def adapter_claim(adapter_id: str, db: AsyncSession = Depends(get_db),
+                        current_user=Depends(require_roles(*ADMIN, "FINANCE"))):
+    await _rec(db, adapter_id)
+    try:
+        out = await opps.claim(db, adapter_id, current_user.id)
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc))
+    await db.commit()
+    return out
+
+
+@router.post("/adapters/{adapter_id}/certification")
+async def adapter_certification(adapter_id: str, req: CertificationRequest, db: AsyncSession = Depends(get_db),
+                                current_user=Depends(require_roles("OWNER", "ADMIN"))):
+    """Move an adapter through the spec §127 certification stages (one step at a time;
+    checklist + §128 economics required past ECONOMIC_REVIEW; simulated adapters cap at SANDBOX)."""
+    from app.db.models.audit import AuditLog
+    from app.db.models.enums import AuditEventType
+
+    rec = await _rec(db, adapter_id)
+    cert = dict(rec.certification or {})
+    if req.checklist is not None:
+        unknown = [k for k in req.checklist if k not in guard.CERTIFICATION_CHECKLIST]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"unknown checklist items: {', '.join(unknown)}")
+        cert["checklist"] = {**(cert.get("checklist") or {}), **req.checklist}
+    if req.economics is not None:
+        unknown = [k for k in req.economics if k not in guard.ECONOMIC_FIELDS]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"unknown economic fields: {', '.join(unknown)}")
+        cert["economics"] = {**(cert.get("economics") or {}), **req.economics}
+    target = req.stage.upper()
+    problems = guard.certification_problems(rec, target, cert)
+    if problems:
+        raise HTTPException(status_code=409, detail={"stage": target, "problems": problems})
+    prev = rec.certification_stage
+    history = list(cert.get("history") or [])
+    history.append({"from": prev, "to": target, "by": str(current_user.id), "notes": req.notes,
+                    "at": guard.utcnow().isoformat()})
+    cert["history"] = history[-50:]
+    rec.certification = cert
+    rec.certification_stage = target
+    db.add(AuditLog(event_type=AuditEventType.ADAPTER_CERTIFICATION, actor_type="ADMIN", actor_id=current_user.id,
+                    target_type="ADAPTER", event_metadata={"adapter_id": adapter_id, "from": prev, "to": target}))
+    await db.commit()
+    return _adapter_dict(rec)
 
 
 # ── scheduler ────────────────────────────────────────────────────────────────

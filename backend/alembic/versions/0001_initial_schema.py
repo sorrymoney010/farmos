@@ -12,13 +12,22 @@ description = "Create core FARMOS tables"
 
 
 def upgrade() -> None:
+    # UUID defaults use gen_random_uuid(), built into PostgreSQL 13+ (no uuid-ossp needed;
+    # managed/minimal Postgres builds often lack contrib extensions). On PostgreSQL < 13
+    # the same function comes from pgcrypto. The app also generates UUIDs client-side.
     op.execute(text("""
-        CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+        DO $$
+        BEGIN
+          IF current_setting('server_version_num')::int < 130000 THEN
+            CREATE EXTENSION IF NOT EXISTS pgcrypto;
+          END IF;
+        END
+        $$;
     """))
 
     op.create_table(
         "users",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("email", sa.String(255), nullable=False),
         sa.Column("password_hash", sa.Text, nullable=False),
         sa.Column("full_name", sa.String(255), nullable=True),
@@ -34,7 +43,7 @@ def upgrade() -> None:
 
     op.create_table(
         "roles",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("name", sa.String(50), nullable=False),
         sa.Column("description", sa.Text, nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
@@ -44,7 +53,7 @@ def upgrade() -> None:
 
     op.create_table(
         "user_roles",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("user_id", UUID(as_uuid=True), nullable=False),
         sa.Column("role_id", UUID(as_uuid=True), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
@@ -58,7 +67,7 @@ def upgrade() -> None:
 
     op.create_table(
         "providers",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("user_id", UUID(as_uuid=True), nullable=False),
         sa.Column("display_name", sa.String(255), nullable=True),
         sa.Column("status", sa.String(30), server_default="PENDING_VERIFICATION", nullable=False),
@@ -72,7 +81,7 @@ def upgrade() -> None:
 
     op.create_table(
         "farms",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("name", sa.String(255), nullable=False),
         sa.Column("description", sa.Text, nullable=True),
         sa.Column("owner_user_id", UUID(as_uuid=True), nullable=False),
@@ -85,7 +94,7 @@ def upgrade() -> None:
 
     op.create_table(
         "farm_memberships",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("farm_id", UUID(as_uuid=True), nullable=False),
         sa.Column("provider_id", UUID(as_uuid=True), nullable=False),
         sa.Column("joined_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
@@ -97,7 +106,7 @@ def upgrade() -> None:
 
     op.create_table(
         "devices",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("provider_id", UUID(as_uuid=True), nullable=False),
         sa.Column("farm_id", UUID(as_uuid=True), nullable=True),
         sa.Column("human_id", sa.String(100), nullable=False),
@@ -151,7 +160,7 @@ def upgrade() -> None:
 
     op.create_table(
         "device_benchmarks",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("device_id", UUID(as_uuid=True), nullable=False),
         sa.Column("suite_version", sa.String(50), nullable=False),
         sa.Column("cpu_score", sa.Numeric(8, 4), nullable=True),
@@ -172,7 +181,7 @@ def upgrade() -> None:
 
     op.create_table(
         "device_capabilities",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("device_id", UUID(as_uuid=True), nullable=False),
         sa.Column("capability", sa.String(100), nullable=False),
         sa.Column("enabled", sa.Boolean, server_default=sa.text("true"), nullable=False),
@@ -184,7 +193,7 @@ def upgrade() -> None:
 
     op.create_table(
         "device_health_events",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("device_id", UUID(as_uuid=True), nullable=False),
         sa.Column("event_type", sa.String(100), nullable=False),
         sa.Column("severity", sa.String(20), nullable=False),
@@ -216,7 +225,7 @@ def upgrade() -> None:
 
     op.create_table(
         "system_settings",
-        sa.Column("id", UUID(as_uuid=True), server_default=text("uuid_generate_v4()"), nullable=False),
+        sa.Column("id", UUID(as_uuid=True), server_default=text("gen_random_uuid()"), nullable=False),
         sa.Column("key", sa.String(100), nullable=False),
         sa.Column("value", sa.JSON, server_default="{}", nullable=False),
         sa.Column("description", sa.Text, nullable=True),
