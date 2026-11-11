@@ -523,9 +523,9 @@ async def request_benchmark(
     job = Job(
         workload_type=JobType.BENCHMARK.value,
         status=JobStatus.DISPATCHED,
-        priority=10,
+        priority=1000,  # higher runs first; benchmarks gate everything else
         requested_resources={"suite_version": suite, "max_runtime_seconds": 120},
-        adapter_id="internal",
+        adapter_id="system",
         customer_id=current_user.id,
         max_runtime_seconds=120,
     )

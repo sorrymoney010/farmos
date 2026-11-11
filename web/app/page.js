@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import RevenueEngine from "./RevenueEngine";
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -29,6 +30,7 @@ export default function Home() {
   const [provider, setProvider] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     const saved = typeof window !== "undefined" ? window.localStorage.getItem("farmos_token") : null;
@@ -61,6 +63,7 @@ export default function Home() {
       setJobs(await jobsRes.json());
       setRevenue(revenueRes.ok ? await revenueRes.json() : null);
       setProvider(providerRes.ok ? await providerRes.json() : null);
+      setRefreshKey((k) => k + 1);
     } catch (e) {
       setError(String(e.message || e));
     } finally {
@@ -92,7 +95,7 @@ export default function Home() {
     const counts = { pending: 0, running: 0, complete: 0, other: 0 };
     for (const j of jobs || []) {
       const st = (j.status || "").toUpperCase();
-      if (["CREATED", "QUEUED", "DISPATCHED"].includes(st)) counts.pending += 1;
+      if (["CREATED", "VALIDATED", "QUEUED", "MATCHED", "DISPATCHED"].includes(st)) counts.pending += 1;
       else if (["ACCEPTED", "RUNNING", "RESULT_SUBMITTED", "VERIFYING"].includes(st)) counts.running += 1;
       else if (["COMPLETE", "COMPLETED", "VERIFIED", "PAID"].includes(st)) counts.complete += 1;
       else counts.other += 1;
@@ -222,6 +225,10 @@ export default function Home() {
           <p className="muted">TEST credits stay separate from REAL USDC in the ledger model.</p>
         </Section>
       </div>
+
+      {fleet ? (
+        <RevenueEngine apiUrl={apiUrl} authHeaders={authHeaders} refreshKey={refreshKey} Section={Section} Badge={Badge} />
+      ) : null}
     </main>
   );
 }
