@@ -1,7 +1,7 @@
 """Phase 2: job leases, retries/dead-letter, idempotency, verification spec.
 
 Revision ID: 0004_job_leases
-Revises: 0003_device_safety
+Revises: 0003b_baseline_tables
 """
 
 from alembic import op
@@ -10,7 +10,7 @@ from sqlalchemy.dialects.postgresql import UUID
 
 
 revision = "0004_job_leases"
-down_revision = "0003_device_safety"
+down_revision = "0003b_baseline_tables"
 branch_labels = None
 depends_on = None
 

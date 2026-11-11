@@ -224,6 +224,17 @@ class RevenueAdapterRecord(Base):
     last_health_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_discovery_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_reconcile: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    # Sprint 10 hardening: call accounting, circuit breaker, granular switches (spec §139),
+    # certification record (spec §127/§128) and the last simulated claim.
+    call_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    error_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_error_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    circuit_open_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    switches: Mapped[Any] = mapped_column(JSON, default=dict, server_default="{}", nullable=False)
+    certification: Mapped[Any] = mapped_column(JSON, default=dict, server_default="{}", nullable=False)
+    last_claim: Mapped[Any] = mapped_column(JSON, default=dict, server_default="{}", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False

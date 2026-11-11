@@ -153,8 +153,14 @@ async def confirm_revenue(db: AsyncSession, *, job_ids: list | None = None, limi
     report: dict[str, Any] = {"confirmed": [], "disputed": [], "skipped": {}, "book": source.book,
                               "source": source.name}
     chain = get_provider()
+    from app.services import opportunity_service as opps
+    adapter_blocks: dict[str, Any] = {}
     for row in rows:
         jid = str(row.job_id)
+        block = await opps.earnings_release_block(db, row.adapter_id, adapter_blocks)
+        if block:  # spec §126: unreconciled external revenue stays unconfirmed
+            report["skipped"][jid] = block
+            continue
         device = (await db.execute(select(Device).where(Device.id == row.device_id))).scalar_one_or_none() \
             if row.device_id else None
         if device is None:
@@ -225,7 +231,13 @@ async def release_pending(db: AsyncSession, *, now: datetime | None = None, limi
                                    JobEconomics.confirmed_at <= cutoff, JobEconomics.provider_id.is_not(None))
         .order_by(JobEconomics.confirmed_at).limit(limit).with_for_update(skip_locked=True))).scalars().all()
     report: dict[str, Any] = {"released": [], "held": {}}
+    from app.services import opportunity_service as opps
+    adapter_blocks: dict[str, Any] = {}
     for row in rows:
+        block = await opps.earnings_release_block(db, row.adapter_id, adapter_blocks)
+        if block:  # spec §126: do not convert external estimates/pending to AVAILABLE
+            report["held"][str(row.job_id)] = block
+            continue
         prov = (await db.execute(select(Provider).where(Provider.id == row.provider_id))).scalar_one_or_none()
         if prov is None or prov.payout_hold:
             report["held"][str(row.job_id)] = "provider payout hold"

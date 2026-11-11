@@ -17,7 +17,9 @@ from app.db.models.enums import AuditEventType
 from app.db.models.finance import RiskEvent
 
 KILL_KEY = "finance_kill_switches"
-SWITCHES = ("PAUSE_WITHDRAWALS", "PAUSE_PAYOUTS", "PAUSE_REVENUE_CONFIRMATION")
+# PAUSE_EXTERNAL_ADAPTERS (spec §139): global stop for every EXTERNAL adapter — no discovery,
+# no new scheduling, no claims, and no release of its pending earnings to AVAILABLE.
+SWITCHES = ("PAUSE_WITHDRAWALS", "PAUSE_PAYOUTS", "PAUSE_REVENUE_CONFIRMATION", "PAUSE_EXTERNAL_ADAPTERS")
 
 
 class FinanceError(Exception):

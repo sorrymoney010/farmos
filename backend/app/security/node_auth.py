@@ -26,7 +26,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from jose import jwt
 from redis.asyncio import Redis
-from redis.asyncio.connection import ConnectionPool
+from redis.asyncio.connection import BlockingConnectionPool, ConnectionPool
 
 from app.config import settings
 
@@ -41,7 +41,12 @@ def init_redis() -> None:
     """Create the shared Redis connection pool (called once at app startup)."""
     global _POOL
     if _POOL is None:
-        _POOL = ConnectionPool.from_url(settings.REDIS_URL, decode_responses=True, max_connections=20)
+        # BlockingConnectionPool: under load callers wait for a free connection
+        # (bounded by REDIS_POOL_TIMEOUT_SECONDS) instead of failing immediately with
+        # "Too many connections" (found by the Sprint 10 fleet load test).
+        _POOL = BlockingConnectionPool.from_url(settings.REDIS_URL, decode_responses=True,
+                                                max_connections=max(settings.REDIS_POOL_SIZE, 20),
+                                                timeout=settings.REDIS_POOL_TIMEOUT_SECONDS)
 
 
 async def close_redis() -> None:
