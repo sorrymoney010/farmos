@@ -106,6 +106,18 @@ class Job(Base):
     deadline_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # ── Phase 2: leases, retries, dead-letter, idempotency, verification ──
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    max_retries: Mapped[int] = mapped_column(Integer, default=3, server_default="3", nullable=False)
+    dead_lettered: Mapped[bool] = mapped_column(default=False, server_default="false", nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(128), unique=True, nullable=True)
+    parent_job_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    # Server-only verification data (role, known answers, excluded devices).
+    # NEVER sent to devices.
+    verification_spec: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -168,6 +180,44 @@ class JobAssignment(Base):
 
     job: Mapped["Job"] = relationship("Job", back_populates="assignment")
     device: Mapped["Device"] = relationship("Device", back_populates="job_assignments")
+
+
+class JobLease(Base):
+    """One dispatch attempt of a job to a device (spec §71).
+
+    Holds lease_id, device_id, start, expiry and grace; also archives the
+    attempt's result + verification outcome so history survives requeues
+    (job_assignments / job_results / job_verifications hold the CURRENT attempt).
+    """
+
+    __tablename__ = "job_leases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    device_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("devices.id", ondelete="CASCADE"), nullable=False
+    )
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    grace_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    renewals: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    result_hash: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    evidence: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+
+    __table_args__ = (
+        Index("ix_job_leases_job_id", "job_id"),
+        Index("ix_job_leases_device_id", "device_id"),
+        Index("ix_job_leases_status_expires", "status", "expires_at"),
+    )
 
 
 class JobResult(Base):

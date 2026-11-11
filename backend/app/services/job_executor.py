@@ -23,7 +23,21 @@ LEDGER_CONFIG: dict[JobType, dict[str, float]] = {
     JobType.API_REQUEST: {"reward_test_usd": 0.0001, "reward_real_usd": 0.005},
     JobType.MONITOR: {"reward_test_usd": 0.0001, "reward_real_usd": 0.001},
     JobType.DATA_TRANSFORM: {"reward_test_usd": 0.0001, "reward_real_usd": 0.003},
+    JobType.CHECKSUM: {"reward_test_usd": 0.0001, "reward_real_usd": 0.002},
+    JobType.COMPRESSION: {"reward_test_usd": 0.0001, "reward_real_usd": 0.002},
+    JobType.JSON_TRANSFORM: {"reward_test_usd": 0.0001, "reward_real_usd": 0.002},
 }
+
+
+async def job_already_credited(db: AsyncSession, job_id: UUID, reference_type: str = "JOB_RESULT_TEST") -> bool:
+    row = (
+        await db.execute(
+            select(LedgerEntry.id).where(
+                LedgerEntry.reference_type == reference_type, LedgerEntry.reference_id == job_id
+            )
+        )
+    ).first()
+    return row is not None
 
 
 async def ensure_device_earnings_accounts(db: AsyncSession, device_id: UUID) -> tuple[UUID, UUID]:
@@ -330,6 +344,20 @@ async def credit_device_earnings(
 
     test_account_id, real_account_id = await ensure_device_earnings_accounts(db, device_id)
     account_id: UUID = real_account_id if is_real_revenue else test_account_id
+
+    # Idempotent: a job is credited at most once per account (spec §71: late or
+    # repeated results never receive duplicate financial credit).
+    existing = (
+        await db.execute(
+            select(LedgerEntry).where(
+                LedgerEntry.account_id == account_id,
+                LedgerEntry.reference_type == reference_type,
+                LedgerEntry.reference_id == job.id,
+            )
+        )
+    ).scalars().first()
+    if existing is not None:
+        return existing
 
     transaction_id: UUID = uuid4()
     entry = LedgerEntry(

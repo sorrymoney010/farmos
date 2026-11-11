@@ -83,6 +83,10 @@ class JobType(str, enum.Enum):
     MONITOR = "monitor"
     DATA_TRANSFORM = "data_transform"
     BENCHMARK = "benchmark"
+    # Phase 2: internal deterministic CPU/data workloads (spec §44)
+    CHECKSUM = "checksum"
+    COMPRESSION = "compression"
+    JSON_TRANSFORM = "json_transform"
 
 
 class TemperatureState(str, enum.Enum):

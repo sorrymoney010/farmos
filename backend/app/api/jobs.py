@@ -1,15 +1,14 @@
-"""FARMOS job endpoints — dispatch, device accept, result submission, verification, device polling."""
+"""FARMOS job endpoints — dispatch, leases, device accept/renew, result submission,
+verification, device polling (spec §59, §60, §67, §69-§71, §136)."""
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select, update
@@ -29,18 +28,24 @@ from app.db.models.devices import Device
 from app.db.models.jobs_ledger import (
     Job,
     JobAssignment,
-    JobEvent,
     JobResult,
-    JobVerification,
     LedgerAccount,
     LedgerEntry,
 )
 from app.db.session import get_db
-from app.dependencies import get_current_user, require_roles
+from app.dependencies import require_roles
 from app.logging import get_logger
-from app.security.node_auth import verify_node_token, verify_request_signature, ensure_timestamp_fresh
+from app.security.node_auth import (
+    ensure_timestamp_fresh,
+    mark_nonce_used,
+    verify_node_token,
+    verify_request_signature,
+)
 from app.services import benchmark_service as bench_svc
+from app.services import lease_service as leases
+from app.services import verification_service as vsvc
 from app.services.device_safety import SCHEDULABLE_STATUSES, dispatch_block_reason
+from app.workloads import cpu_data
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -53,7 +58,8 @@ class JobCreateRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     expected_revenue_usd: float | None = None
     expected_cost_usd: float | None = None
-    max_runtime_seconds: int | None = None
+    max_runtime_seconds: int | None = Field(default=None, ge=1, le=86400)
+    max_retries: int | None = Field(default=None, ge=0, le=10)
     priority: int = 100
     device_id: UUID | None = None  # optional: dispatch to specific device
 
@@ -69,25 +75,56 @@ class JobAcceptRequest(BaseModel):
     signature: str
 
 
+class LeaseRenewRequest(BaseModel):
+    request_nonce: str
+    request_timestamp: str
+    lease_id: UUID
+    signature: str
+
+
 class JobResultSubmitRequest(BaseModel):
     request_nonce: str
     request_timestamp: str
     signature: str
-    result_hash: str
-    result_uri: str | None = None
+    result_hash: str = Field(min_length=64, max_length=128)
+    result_uri: str | None = Field(default=None, max_length=2_000_000)
     execution_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
-# ── Helper: ensure job exists and belongs to requester ────────────────────────
+def _payload_of(job: Job) -> dict[str, Any]:
+    if not job.requested_resources:
+        return {}
+    try:
+        return json.loads(job.requested_resources) if isinstance(job.requested_resources, str) else dict(job.requested_resources)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {"raw": str(job.requested_resources)}
 
-async def _get_job_for_user(db: AsyncSession, job_id: UUID, user_id: UUID) -> Job:
-    result = await db.execute(
-        select(Job).where(Job.id == job_id, Job.customer_id == user_id)
-    )
-    job = result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    return job
+
+def _job_summary(job: Job) -> dict[str, Any]:
+    return {
+        "job_id": str(job.id),
+        "status": job.status.value,
+        "workload_type": job.workload_type,
+        "priority": job.priority,
+        "retry_count": job.retry_count,
+        "max_retries": job.max_retries,
+        "dead_lettered": job.dead_lettered,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+    }
+
+
+def _verification_view(job: Job) -> dict[str, Any] | None:
+    v = job.verification
+    if v is None:
+        return None
+    ev = v.evidence or {}
+    return {
+        "status": v.status,
+        "method": v.method,
+        "confidence": ev.get("confidence"),
+        "reason": ev.get("reason"),
+        "verified_at": v.verified_at.isoformat() if v.verified_at else None,
+    }
 
 
 # ── Create job ────────────────────────────────────────────────────────────────
@@ -97,15 +134,27 @@ async def create_job(
     req: JobCreateRequest,
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_roles("OWNER", "ADMIN", "CUSTOMER")),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=128),
 ):
     job_type = req.workload_type
     try:
         JobType(job_type)
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported workload_type: {job_type}",
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsupported workload_type: {job_type}")
+    if job_type in cpu_data.CPU_DATA_WORKLOADS:
+        try:
+            cpu_data.validate_payload(job_type, req.payload)
+        except cpu_data.WorkloadError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid payload: {exc}")
+
+    # Spec §136: duplicate Idempotency-Key returns the original job.
+    if idempotency_key:
+        scoped_key = f"{current_user.id}:{idempotency_key}"
+        existing = (await db.execute(select(Job).where(Job.idempotency_key == scoped_key))).scalar_one_or_none()
+        if existing is not None:
+            return {**_job_summary(existing), "idempotent_replay": True}
+    else:
+        scoped_key = None
 
     job = Job(
         workload_type=job_type,
@@ -115,29 +164,19 @@ async def create_job(
         expected_revenue_usd=req.expected_revenue_usd,
         expected_cost_usd=req.expected_cost_usd,
         max_runtime_seconds=req.max_runtime_seconds,
+        max_retries=req.max_retries if req.max_retries is not None else settings.JOB_DEFAULT_MAX_RETRIES,
+        retry_count=0,
+        idempotency_key=scoped_key,
+        verification_spec={"role": vsvc.PRIMARY},
         adapter_id="internal",
         customer_id=current_user.id,
     )
     db.add(job)
     await db.flush()
-
-    event = JobEvent(
-        job_id=job.id,
-        from_status=None,
-        to_status=JobStatus.CREATED.value,
-        actor_type=JobEventActorType.USER,
-        actor_id=current_user.id,
-    )
-    db.add(event)
+    leases.add_event(db, job.id, None, JobStatus.CREATED.value, actor_type=JobEventActorType.USER,
+                     actor_id=current_user.id)
     await db.commit()
-
-    return {
-        "job_id": str(job.id),
-        "status": job.status.value,
-        "workload_type": job.workload_type,
-        "priority": job.priority,
-        "created_at": job.created_at.isoformat(),
-    }
+    return {**_job_summary(job), "idempotent_replay": False}
 
 
 # ── List jobs ─────────────────────────────────────────────────────────────────
@@ -147,17 +186,11 @@ async def list_jobs(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS", "CUSTOMER")),
 ):
-    result = await db.execute(
-        select(Job).order_by(desc(Job.created_at)).limit(100)
-    )
+    result = await db.execute(select(Job).order_by(desc(Job.created_at)).limit(100))
     jobs = result.scalars().all()
     return [
         {
-            "job_id": str(j.id),
-            "status": j.status.value,
-            "workload_type": j.workload_type,
-            "priority": j.priority,
-            "created_at": j.created_at.isoformat(),
+            **_job_summary(j),
             "expected_revenue_usd": float(j.expected_revenue_usd) if j.expected_revenue_usd else None,
             "expected_cost_usd": float(j.expected_cost_usd) if j.expected_cost_usd else None,
         }
@@ -173,32 +206,28 @@ async def get_job(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS", "CUSTOMER")),
 ):
-    # Eager-load the assignment: lazy loading is not allowed under asyncio.
+    # Eager-load relationships: lazy loading is not allowed under asyncio.
     result = await db.execute(
-        select(Job).options(selectinload(Job.assignment)).where(Job.id == job_id)
+        select(Job)
+        .options(selectinload(Job.assignment), selectinload(Job.verification))
+        .where(Job.id == job_id)
     )
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-
-    payload: dict[str, Any] = {}
-    if job.requested_resources:
-        try:
-            payload = json.loads(job.requested_resources) if isinstance(job.requested_resources, str) else dict(job.requested_resources)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            payload = {"raw": str(job.requested_resources)}
-
+    lease = await leases.latest_lease(db, job.id)
     return {
-        "job_id": str(job.id),
-        "status": job.status.value,
-        "workload_type": job.workload_type,
-        "priority": job.priority,
-        "payload": payload,
+        **_job_summary(job),
+        "payload": _payload_of(job),
         "expected_revenue_usd": float(job.expected_revenue_usd) if job.expected_revenue_usd else None,
         "expected_cost_usd": float(job.expected_cost_usd) if job.expected_cost_usd else None,
         "max_runtime_seconds": job.max_runtime_seconds,
-        "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
+        "last_error": job.last_error,
+        "parent_job_id": str(job.parent_job_id) if job.parent_job_id else None,
+        "role": vsvc.role_of(job),
+        "lease": leases.lease_dict(lease),
+        "verification": _verification_view(job),
         "assignment": (
             {
                 "device_id": str(job.assignment.device_id),
@@ -219,8 +248,7 @@ async def dispatch_job(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS")),
 ):
-    job_result = await db.execute(select(Job).where(Job.id == req.job_id))
-    job = job_result.scalar_one_or_none()
+    job = (await db.execute(select(Job).where(Job.id == req.job_id).with_for_update())).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
     if job.status not in {JobStatus.CREATED, JobStatus.QUEUED}:
@@ -229,143 +257,125 @@ async def dispatch_job(
             detail=f"Job cannot be dispatched in status {job.status.value}",
         )
 
-    device_result = await db.execute(select(Device).where(Device.id == req.device_id))
-    device = device_result.scalar_one_or_none()
+    device = (await db.execute(select(Device).where(Device.id == req.device_id))).scalar_one_or_none()
     if not device:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
     # Coder rule §53.9: no device job without policy check (status + thermal + battery).
+    now = datetime.now(timezone.utc)
     thresholds = await bench_svc.thresholds_for_device(db, device)
-    blocked = dispatch_block_reason(device, job.workload_type, thresholds, datetime.now(timezone.utc))
+    blocked = dispatch_block_reason(device, job.workload_type, thresholds, now)
     if blocked:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Dispatch blocked by safety policy: {blocked}",
-        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Dispatch blocked by safety policy: {blocked}")
 
-    # Create assignment
-    assignment = JobAssignment(
-        job_id=job.id,
-        device_id=req.device_id,
-        assigned_at=datetime.now(timezone.utc),
-    )
+    assignment = JobAssignment(job_id=job.id, device_id=req.device_id, assigned_at=now)
     db.add(assignment)
-
-    # Update job status
-    await db.execute(
-        update(Job)
-        .where(Job.id == job.id)
-        .values(status=JobStatus.DISPATCHED, updated_at=datetime.now(timezone.utc))
-    )
-
-    event = JobEvent(
-        job_id=job.id,
-        from_status=job.status.value,
-        to_status=JobStatus.DISPATCHED.value,
-        actor_type=JobEventActorType.SYSTEM,
-        actor_id=None,
-    )
-    db.add(event)
+    lease = await leases.issue_lease(db, job, device.id, now)
+    leases.add_event(db, job.id, job.status.value, JobStatus.DISPATCHED.value,
+                     reason=f"lease {lease.id} attempt {lease.attempt} to {device.human_id}",
+                     actor_type=JobEventActorType.ADMIN, actor_id=current_user.id)
+    job.status = JobStatus.DISPATCHED
+    job.updated_at = now
     await db.commit()
 
-    logger.info(
-        "job_dispatched",
-        job_id=str(job.id),
-        device_id=str(device.id),
-        device_human_id=device.human_id,
-    )
-
+    logger.info("job_dispatched", job_id=str(job.id), device_id=str(device.id),
+                device_human_id=device.human_id, lease_id=str(lease.id))
     return {
         "job_id": str(job.id),
         "device_id": str(device.id),
         "device_human_id": device.human_id,
         "status": JobStatus.DISPATCHED.value,
         "assigned_at": assignment.assigned_at.isoformat(),
+        "lease": leases.lease_dict(lease),
     }
 
 
-# ── Device: poll for next job ─────────────────────────────────────────────────
+# ── Device auth helpers ───────────────────────────────────────────────────────
 
 node_bearer = HTTPBearer(auto_error=False)
 
+
+async def _node_device(db: AsyncSession, credentials: HTTPAuthorizationCredentials | None) -> Device:
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Node token required")
+    token_payload = verify_node_token(credentials.credentials)
+    if not token_payload:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token")
+    try:
+        device_id = UUID(str(token_payload.get("sub")))
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token subject")
+    device = (await db.execute(select(Device).where(Device.id == device_id))).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    return device
+
+
+def _verify_signed(device: Device, timestamp: str, payload: dict[str, str], signature: str) -> None:
+    if not device.public_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Device has no public key")
+    try:
+        ensure_timestamp_fresh(timestamp, max_skew_seconds=settings.NODE_REQUEST_MAX_SKEW_SECONDS)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    try:
+        verify_request_signature(device.public_key, payload, signature)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
+
+
+async def _consume_nonce(scope: str, nonce: str) -> None:
+    if not await mark_nonce_used(scope, nonce, ttl_seconds=settings.NODE_REQUEST_MAX_SKEW_SECONDS):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Nonce already used")
+
+
+# ── Device: poll for next job ─────────────────────────────────────────────────
 
 @router.post("/device/jobs/next")
 async def device_poll_next_job(
     db: AsyncSession = Depends(get_db),
     credentials: HTTPAuthorizationCredentials | None = Depends(node_bearer),
 ):
-    """Device polls for its next dispatched-but-unaccepted job.
+    """Device polls for its next dispatched-but-unaccepted job (with its lease)."""
+    device = await _node_device(db, credentials)
+    now = datetime.now(timezone.utc)
 
-    Requires valid node token in Authorization: Bearer <node_token>.
-    Returns the job payload if one is available, or {"job": null}.
-    """
-    if not credentials or not credentials.credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Node token required")
+    if settings.LEASE_SWEEP_ON_POLL:
+        await leases.sweep_expired(db, now, limit=25)
 
-    token_payload = verify_node_token(credentials.credentials)
-    if not token_payload:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token")
-
-    device_id_str = token_payload.get("sub")
-    if not device_id_str:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Node token missing subject")
-
-    try:
-        device_id: UUID = UUID(device_id_str)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token subject")
-
-    device_result = await db.execute(select(Device).where(Device.id == device_id))
-    device = device_result.scalar_one_or_none()
-    if not device:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
-
-    # Find the oldest dispatched job for this device that hasn't been accepted yet
-    job_q = await db.execute(
-        select(Job)
-        .join(JobAssignment)
-        .where(
-            JobAssignment.device_id == device_id,
-            Job.status == JobStatus.DISPATCHED,
+    job = (
+        await db.execute(
+            select(Job).join(JobAssignment)
+            .where(JobAssignment.device_id == device.id, Job.status == JobStatus.DISPATCHED)
+            .order_by(Job.priority, Job.created_at).limit(1)
         )
-        .order_by(Job.created_at)
-        .limit(1)
-    )
-    job = job_q.scalar_one_or_none()
-
+    ).scalar_one_or_none()
     if not job:
         return {"job": None, "device_id": str(device.id), "status": device.status.value}
 
     # Defense in depth: never hand out work a device must not run right now
-    # (e.g. it overheated after dispatch). The job stays DISPATCHED for later.
+    # (e.g. it overheated after dispatch). The job stays DISPATCHED until its
+    # accept lease runs out, then is requeued for another device.
     thresholds = await bench_svc.thresholds_for_device(db, device)
-    blocked = dispatch_block_reason(device, job.workload_type, thresholds, datetime.now(timezone.utc))
+    blocked = dispatch_block_reason(device, job.workload_type, thresholds, now)
     if blocked:
         return {
-            "job": None,
-            "paused": True,
-            "reason": blocked,
-            "retry_after_seconds": 30,
-            "device_id": str(device.id),
-            "status": device.status.value,
+            "job": None, "paused": True, "reason": blocked, "retry_after_seconds": 30,
+            "device_id": str(device.id), "status": device.status.value,
         }
 
-    # Parse payload
-    payload: dict[str, Any] = {}
-    if job.requested_resources:
-        try:
-            payload = json.loads(job.requested_resources) if isinstance(job.requested_resources, str) else dict(job.requested_resources)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            payload = {"raw": str(job.requested_resources)}
-
+    lease = await leases.current_lease(db, job.id, device.id)
+    lease_view = leases.lease_dict(lease)
     return {
         "job_id": str(job.id),
         "job": {
             "job_id": str(job.id),
             "workload_type": job.workload_type,
-            "payload": payload,
+            "payload": _payload_of(job),
             "max_runtime_seconds": job.max_runtime_seconds,
             "created_at": job.created_at.isoformat(),
+            "lease": lease_view,
         },
+        "lease": lease_view,
         "device_id": str(device.id),
         "device_human_id": device.human_id,
     }
@@ -380,107 +390,119 @@ async def device_accept_job(
     db: AsyncSession = Depends(get_db),
     credentials: HTTPAuthorizationCredentials | None = Depends(node_bearer),
 ):
-    """Device accepts a dispatched job."""
-    if not credentials or not credentials.credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Node token required")
-
-    token_payload = verify_node_token(credentials.credentials)
-    if not token_payload:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token")
-
-    device_id_str = token_payload.get("sub")
-    try:
-        device_id: UUID = UUID(device_id_str)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token subject")
-
-    device_row = await db.execute(select(Device).where(Device.id == device_id))
-    device = device_row.scalar_one_or_none()
-    if not device:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
-    if not device.public_key:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Device has no public key")
-
-    # Verify timestamp freshness
-    try:
-        ensure_timestamp_fresh(req.request_timestamp, max_skew_seconds=settings.NODE_REQUEST_MAX_SKEW_SECONDS)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-
-    # Verify signature against the enrolled device key (node JWT has no pubkey claim).
-    payload_to_verify: dict[str, str] = {
+    """Device accepts a dispatched job; the lease switches to the runtime window."""
+    device = await _node_device(db, credentials)
+    _verify_signed(device, req.request_timestamp, {
         "request_nonce": req.request_nonce,
         "request_timestamp": req.request_timestamp,
         "job_id": str(job_id),
-        "device_id": device_id_str,
-    }
-    try:
-        verify_request_signature(device.public_key, payload_to_verify, req.signature)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
+        "device_id": str(device.id),
+    }, req.signature)
+    now = datetime.now(timezone.utc)
 
-    # Find job assignment
-    job_q = await db.execute(
-        select(Job)
-        .options(selectinload(Job.assignment))
-        .join(JobAssignment)
-        .where(
-            Job.id == job_id,
-            JobAssignment.device_id == device_id,
-            Job.status == JobStatus.DISPATCHED,
+    job = (
+        await db.execute(
+            select(Job).options(selectinload(Job.assignment)).join(JobAssignment)
+            .where(Job.id == job_id, JobAssignment.device_id == device.id).with_for_update(of=Job)
         )
-    )
-    job = job_q.scalar_one_or_none()
-    if not job:
+    ).scalar_one_or_none()
+    if job is None:
+        last = await leases.latest_lease(db, job_id, device.id)
+        if last is not None and last.status == leases.EXPIRED:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Lease expired; job was requeued")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found or not assigned to this device")
 
+    lease = await leases.current_lease(db, job.id, device.id)
+    # Idempotent: re-accepting a job this device already accepted returns 200.
+    if job.status in {JobStatus.ACCEPTED, JobStatus.RUNNING}:
+        return {"job_id": str(job.id), "status": job.status.value, "idempotent_replay": True,
+                "accepted_at": job.assignment.accepted_at.isoformat() if job.assignment and job.assignment.accepted_at else None,
+                "lease": leases.lease_dict(lease)}
+    if job.status != JobStatus.DISPATCHED:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Job not acceptable in status {job.status.value}")
+
+    await _consume_nonce(f"accept:{device.id}", req.request_nonce)
+
+    if lease is not None and not leases.is_live(lease, now):
+        await leases.expire_lease(db, lease, now, reason="accept window elapsed")
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Lease expired; job was requeued")
+
     thresholds = await bench_svc.thresholds_for_device(db, device)
-    blocked = dispatch_block_reason(device, job.workload_type, thresholds, datetime.now(timezone.utc))
+    blocked = dispatch_block_reason(device, job.workload_type, thresholds, now)
     if blocked:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Accept blocked by safety policy: {blocked}")
 
-    # Mark accepted
-    await db.execute(
-        update(Job)
-        .where(Job.id == job.id)
-        .values(status=JobStatus.ACCEPTED, updated_at=datetime.now(timezone.utc))
-    )
+    if lease is None:  # job dispatched before leases existed
+        lease = await leases.issue_lease(db, job, device.id, now)
+    leases.on_accept(lease, job, now)
     if job.assignment:
-        await db.execute(
-            update(JobAssignment)
-            .where(JobAssignment.job_id == job.id)
-            .values(accepted_at=datetime.now(timezone.utc))
-        )
+        job.assignment.accepted_at = now
+    leases.add_event(db, job.id, JobStatus.DISPATCHED.value, JobStatus.ACCEPTED.value,
+                     reason=f"lease {lease.id} accepted", actor_type=JobEventActorType.NODE, actor_id=device.id)
+    job.status = JobStatus.ACCEPTED
+    job.updated_at = now
 
-    event = JobEvent(
-        job_id=job.id,
-        from_status=JobStatus.DISPATCHED.value,
-        to_status=JobStatus.ACCEPTED.value,
-        actor_type=JobEventActorType.NODE,
-        actor_id=device_id,
-    )
-    db.add(event)
-
-    # Update device status to RUNNING (only from schedulable states; a
-    # BENCHMARKING node keeps its onboarding status while it benchmarks).
+    # Device -> RUNNING only from schedulable states (a BENCHMARKING node keeps
+    # its onboarding status while it benchmarks).
     await db.execute(
         update(Device)
-        .where(Device.id == device_id, Device.status.in_(list(SCHEDULABLE_STATUSES)))
-        .values(status=DeviceStatus.RUNNING, updated_at=datetime.now(timezone.utc))
+        .where(Device.id == device.id, Device.status.in_(list(SCHEDULABLE_STATUSES)))
+        .values(status=DeviceStatus.RUNNING, updated_at=now)
     )
-
     await db.commit()
+    logger.info("job_accepted", job_id=str(job.id), device_id=str(device.id), lease_id=str(lease.id))
+    return {"job_id": str(job.id), "status": JobStatus.ACCEPTED.value, "accepted_at": now.isoformat(),
+            "idempotent_replay": False, "lease": leases.lease_dict(lease)}
 
-    logger.info("job_accepted", job_id=str(job.id), device_id=str(device_id))
 
-    return {
-        "job_id": str(job.id),
-        "status": JobStatus.ACCEPTED.value,
-        "accepted_at": datetime.now(timezone.utc).isoformat(),
-    }
+# ── Device: renew lease ───────────────────────────────────────────────────────
+
+@router.post("/device/jobs/{job_id}/lease/renew")
+async def device_renew_lease(
+    job_id: UUID,
+    req: LeaseRenewRequest,
+    db: AsyncSession = Depends(get_db),
+    credentials: HTTPAuthorizationCredentials | None = Depends(node_bearer),
+):
+    """Extend a running job's lease (capped at LEASE_MAX_TOTAL_SECONDS)."""
+    device = await _node_device(db, credentials)
+    _verify_signed(device, req.request_timestamp, {
+        "request_nonce": req.request_nonce,
+        "request_timestamp": req.request_timestamp,
+        "job_id": str(job_id),
+        "device_id": str(device.id),
+        "lease_id": str(req.lease_id),
+    }, req.signature)
+    await _consume_nonce(f"renew:{device.id}", req.request_nonce)
+    now = datetime.now(timezone.utc)
+
+    from app.db.models.jobs_ledger import JobLease
+    lease = (
+        await db.execute(select(JobLease).where(JobLease.id == req.lease_id, JobLease.job_id == job_id,
+                                                JobLease.device_id == device.id).with_for_update())
+    ).scalar_one_or_none()
+    if lease is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lease not found")
+    if lease.status == leases.ACTIVE and not leases.is_live(lease, now):
+        await leases.expire_lease(db, lease, now)
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Lease expired; job was requeued")
+    try:
+        leases.renew(lease, now)
+    except leases.LeaseError as exc:
+        raise HTTPException(status_code=exc.code, detail=str(exc))
+    await db.commit()
+    return {"job_id": str(job_id), "lease": leases.lease_dict(lease)}
 
 
 # ── Device: submit result ─────────────────────────────────────────────────────
+
+def _replay_response(job: Job, result_hash: str, outcome: str | None) -> dict[str, Any]:
+    return {"job_id": str(job.id), "status": job.status.value, "result_hash": result_hash,
+            "idempotent_replay": True, "attempt_outcome": outcome,
+            "verification": _verification_view(job)}
+
 
 @router.post("/device/jobs/{job_id}/result")
 async def device_submit_result(
@@ -489,101 +511,95 @@ async def device_submit_result(
     db: AsyncSession = Depends(get_db),
     credentials: HTTPAuthorizationCredentials | None = Depends(node_bearer),
 ):
-    """Device submits a signed job result."""
-    if not credentials or not credentials.credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Node token required")
+    """Device submits a signed job result.
 
-    token_payload = verify_node_token(credentials.credentials)
-    if not token_payload:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token")
-
-    device_id_str = token_payload.get("sub")
-    try:
-        device_id: UUID = UUID(device_id_str)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid node token subject")
-
-    device_row = await db.execute(select(Device).where(Device.id == device_id))
-    device = device_row.scalar_one_or_none()
-    if not device:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
-    if not device.public_key:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Device has no public key")
-
-    # Verify timestamp freshness
-    try:
-        ensure_timestamp_fresh(req.request_timestamp, max_skew_seconds=settings.NODE_REQUEST_MAX_SKEW_SECONDS)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-
-    # Verify signature against the enrolled device key (node JWT has no pubkey claim).
-    payload_to_verify: dict[str, str] = {
+    Idempotent: resubmitting the same result_hash returns the original outcome;
+    a different hash for an already-submitted attempt is rejected (409).
+    Results on an expired lease are rejected and never credited (spec §71).
+    With VERIFY_ON_SUBMIT the result is verified immediately and test credit is
+    posted only if verification passes.
+    """
+    device = await _node_device(db, credentials)
+    _verify_signed(device, req.request_timestamp, {
         "request_nonce": req.request_nonce,
         "request_timestamp": req.request_timestamp,
         "job_id": str(job_id),
-        "device_id": device_id_str,
+        "device_id": str(device.id),
         "result_hash": req.result_hash,
         "result_uri": req.result_uri or "",
-    }
-    try:
-        verify_request_signature(device.public_key, payload_to_verify, req.signature)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
+    }, req.signature)
+    now = datetime.now(timezone.utc)
+    result_hash = req.result_hash.lower()
 
-    # Find job
-    job_q = await db.execute(
-        select(Job)
-        .options(selectinload(Job.assignment))
-        .join(JobAssignment)
-        .where(
-            Job.id == job_id,
-            JobAssignment.device_id == device_id,
-            Job.status.in_([JobStatus.ACCEPTED, JobStatus.RUNNING]),
+    job = (
+        await db.execute(
+            select(Job)
+            .options(selectinload(Job.assignment), selectinload(Job.result), selectinload(Job.verification))
+            .where(Job.id == job_id).with_for_update(of=Job)
         )
-    )
-    job = job_q.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found or not in acceptable state")
+    ).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    # Create job result
-    result = JobResult(
-        job_id=job.id,
-        device_id=device_id,
-        result_hash=req.result_hash,
-        result_uri=req.result_uri,
-        execution_metrics=req.execution_metrics,
-    )
+    # ── idempotency ──
+    if job.result is not None and job.result.device_id == device.id:
+        if job.result.result_hash.lower() == result_hash:
+            return _replay_response(job, result_hash, "RESULT_SUBMITTED")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A different result was already submitted for this attempt")
+    last = await leases.latest_lease(db, job.id, device.id)
+    if job.assignment is None or job.assignment.device_id != device.id:
+        if last is not None and last.result_hash and last.result_hash.lower() == result_hash:
+            return _replay_response(job, result_hash, last.outcome)
+        if last is not None and last.status == leases.EXPIRED:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                                detail="Lease expired; late result rejected (no credit)")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not assigned to this device")
+    if job.status not in {JobStatus.ACCEPTED, JobStatus.RUNNING}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Job not in acceptable state ({job.status.value})")
+
+    await _consume_nonce(f"result:{device.id}", req.request_nonce)
+
+    lease = await leases.current_lease(db, job.id, device.id)
+    if lease is not None and not leases.is_live(lease, now):
+        await leases.expire_lease(db, lease, now, reason="result arrived after lease expiry")
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Lease expired; late result rejected (no credit)")
+
+    result = JobResult(job_id=job.id, device_id=device.id, result_hash=result_hash,
+                       result_uri=req.result_uri, execution_metrics=req.execution_metrics)
     db.add(result)
-
-    # Update job status to RESULT_SUBMITTED
+    job.result = result
+    leases.close_lease(lease, leases.COMPLETED, "RESULT_SUBMITTED", now, result_hash=result_hash)
+    prev = job.status
+    leases.add_event(db, job.id, prev.value, JobStatus.RESULT_SUBMITTED.value,
+                     reason=f"result {result_hash[:16]}", actor_type=JobEventActorType.NODE, actor_id=device.id)
+    job.status = JobStatus.RESULT_SUBMITTED
+    job.updated_at = now
+    if job.assignment:
+        job.assignment.released_at = now
+    # Work is done on-device: RUNNING -> ACTIVE (never override COOLING/QUARANTINED).
     await db.execute(
-        update(Job)
-        .where(Job.id == job.id)
-        .values(status=JobStatus.RESULT_SUBMITTED, updated_at=datetime.now(timezone.utc))
+        update(Device).where(Device.id == device.id, Device.status == DeviceStatus.RUNNING)
+        .values(status=DeviceStatus.ACTIVE, updated_at=now)
     )
+    await db.flush()
 
-    event = JobEvent(
-        job_id=job.id,
-        from_status=job.status.value,
-        to_status=JobStatus.RESULT_SUBMITTED.value,
-        actor_type=JobEventActorType.NODE,
-        actor_id=device_id,
-    )
-    db.add(event)
-
+    verification: dict[str, Any] | None = None
+    if settings.VERIFY_ON_SUBMIT:
+        verification = await vsvc.verify_and_finalize(db, job, result, now=now)
     await db.commit()
 
-    logger.info(
-        "job_result_submitted",
-        job_id=str(job.id),
-        device_id=str(device_id),
-        result_hash=req.result_hash,
-    )
-
+    logger.info("job_result_submitted", job_id=str(job.id), device_id=str(device.id), result_hash=result_hash,
+                verification=(verification or {}).get("verification_status"))
     return {
         "job_id": str(job.id),
-        "status": JobStatus.RESULT_SUBMITTED.value,
-        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "status": job.status.value,
+        "submitted_at": now.isoformat(),
+        "idempotent_replay": False,
+        "verification": verification,
     }
 
 
@@ -591,7 +607,8 @@ async def device_submit_result(
 
 class VerifyResultRequest(BaseModel):
     job_id: UUID
-    auto_credit_test: bool = True  # auto-credit test earnings on verification
+    auto_credit_test: bool = True  # credit test earnings if (and only if) verification passes
+    resolve_pending: bool = False   # finish a VERIFYING job whose redundant sample is stuck
 
 
 @router.post("/verify/result")
@@ -600,92 +617,49 @@ async def verify_and_credit_result(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS")),
 ):
-    """FARMOS verifies a submitted result and optionally credits test earnings.
+    """Verify a submitted result (idempotent).
 
-    After real customer payment is verified, call with is_real_revenue=True
-    to credit the device's REAL earnings ledger.
+    Results are normally verified automatically on submission; calling this for
+    an already-verified job returns the recorded outcome without re-crediting.
     """
-    job_q = await db.execute(select(Job).options(selectinload(Job.assignment)).where(Job.id == req.job_id))
-    job = job_q.scalar_one_or_none()
+    job = await vsvc._load_job(db, req.job_id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    now = datetime.now(timezone.utc)
 
-    if job.status not in {JobStatus.RESULT_SUBMITTED, JobStatus.VERIFYING}:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Job not in verifiable state (current={job.status.value})",
-        )
-
-    # Get the submitted result
-    result_q = await db.execute(
-        select(JobResult).where(JobResult.job_id == job.id)
-    )
-    job_result_obj = result_q.scalar_one_or_none()
-    if not job_result_obj:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No result submitted for this job")
-
-    # Verify
-    from app.services.job_executor import verify_result as svc_verify
-
-    is_valid = await svc_verify(db, job, job_result_obj)
-
-    verification = JobVerification(
-        job_id=job.id,
-        status="PASSED" if is_valid else "FAILED",
-        method="automatic",
-        evidence={
-            "result_hash": job_result_obj.result_hash,
-            "is_valid": is_valid,
-        },
-        verified_at=datetime.now(timezone.utc),
-    )
-    db.add(verification)
-
-    new_status = JobStatus.VERIFIED if is_valid else JobStatus.INVALID_RESULT
-    await db.execute(
-        update(Job)
-        .where(Job.id == job.id)
-        .values(status=new_status, updated_at=datetime.now(timezone.utc))
-    )
-
-    event = JobEvent(
-        job_id=job.id,
-        from_status=job.status.value,
-        to_status=new_status.value,
-        actor_type=JobEventActorType.SYSTEM,
-        actor_id=current_user.id,
-    )
-    db.add(event)
-
-    # Credit test earnings if valid and auto_credit_test is True
-    credited_test = False
-    credited_real = False
-    if is_valid and req.auto_credit_test:
-        from app.services.job_executor import credit_device_earnings as svc_credit
-
-        entry = await svc_credit(db, job, job_result_obj.device_id, job_result_obj, is_real_revenue=False)
-        credited_test = True
-
-    await db.commit()
-
-    # Update device status back to ACTIVE if it was RUNNING
-    if job.assignment:
-        # Only release RUNNING -> ACTIVE; never override COOLING/THROTTLED/QUARANTINED
-        # set by the safety governor while the job was in flight.
-        await db.execute(
-            update(Device)
-            .where(Device.id == job.assignment.device_id, Device.status == DeviceStatus.RUNNING)
-            .values(status=DeviceStatus.ACTIVE, updated_at=datetime.now(timezone.utc))
-        )
+    if job.status == JobStatus.RESULT_SUBMITTED and job.result is not None:
+        out = await vsvc.verify_and_finalize(db, job, job.result, actor_id=current_user.id,
+                                             auto_credit_test=req.auto_credit_test, now=now)
         await db.commit()
+        return {"job_id": str(job.id), "status": job.status.value, "is_valid": out["verification_status"] == vsvc.PASSED,
+                "idempotent_replay": False, "verification": out,
+                "test_earnings_credited": out["test_earnings_credited"], "real_earnings_credited": False,
+                "test_account_type": LedgerAccountType.DEVICE_EARNINGS_TEST.value,
+                "real_account_type": LedgerAccountType.DEVICE_EARNINGS_REAL.value}
 
+    if job.status == JobStatus.VERIFYING and req.resolve_pending:
+        out = await vsvc.resolve_orphaned_primary(db, job.id, now)
+        await db.commit()
+        job = await vsvc._load_job(db, req.job_id)
+
+    view = _verification_view(job)
+    if view is None and job.status not in {JobStatus.VERIFYING}:
+        last = await leases.latest_lease(db, job.id)
+        if last is None or not (last.evidence or {}).get("verification"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Job not in verifiable state (current={job.status.value})")
+        ev = last.evidence["verification"]
+        view = {"status": "FAILED", "method": ev.get("method"), "confidence": ev.get("confidence"),
+                "reason": ev.get("reason"), "verified_at": last.closed_at.isoformat() if last.closed_at else None}
+    from app.services.job_executor import job_already_credited
     return {
         "job_id": str(job.id),
-        "status": new_status.value,
-        "verified_at": verification.verified_at.isoformat(),
-        "is_valid": is_valid,
-        "test_earnings_credited": credited_test,
-        "real_earnings_credited": credited_real,
+        "status": job.status.value,
+        "is_valid": {vsvc.PASSED: True, vsvc.FAILED: False}.get((view or {}).get("status")),
+        "idempotent_replay": True,
+        "verification": view,
+        "test_earnings_credited": await job_already_credited(db, job.id),
+        "real_earnings_credited": False,
         "test_account_type": LedgerAccountType.DEVICE_EARNINGS_TEST.value,
         "real_account_type": LedgerAccountType.DEVICE_EARNINGS_REAL.value,
     }

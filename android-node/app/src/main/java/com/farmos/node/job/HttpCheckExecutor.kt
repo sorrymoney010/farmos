@@ -53,12 +53,14 @@ object HttpCheckExecutor {
 
             val startNs = System.nanoTime()
             httpClient.newCall(builder.build()).execute().use { response ->
-                val durationMs = (System.nanoTime() - startNs) / 1_000_000.0
+                // Integer milliseconds: results avoid floats so canonical hashing
+                // is identical on Kotlin and Python (spec §59 result_hash).
+                val durationMs = (System.nanoTime() - startNs) / 1_000_000L
                 val preview = (response.body?.string().orEmpty()).take(1024)
                 JSONObject()
                     .put("status", "COMPLETED")
                     .put("http_status", response.code)
-                    .put("duration_ms", (Math.round(durationMs * 100.0) / 100.0))
+                    .put("duration_ms", durationMs)
                     .put("bytes_transferred", preview.toByteArray(Charsets.UTF_8).size)
                     .put("response_preview", preview)
                     .put("url", url)

@@ -12,6 +12,7 @@ import com.farmos.node.safety.ThermalGovernor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -100,18 +101,13 @@ object JobLoop {
                         backoffMs = BASE_POLL_MS
                     } else {
                         updateStatus("Jobs: accept ${polled.jobId.take(8)}… (${polled.workloadType})")
-                        repo.acceptJob(polled.jobId)
+                        val lease = repo.acceptJob(polled.jobId) ?: polled.lease
                         updateStatus("Jobs: executing ${polled.workloadType}")
-                        val result = repo.executeJob(polled)
+                        val result = executeWithLease(repo, polled, lease)
                         val status = result.optString("status", "?")
                         updateStatus("Jobs: submit ${polled.jobId.take(8)}… ($status)")
-                        repo.submitResult(polled.jobId, result)
-                        val hint = if (status == "COMPLETED") {
-                            "Jobs: last ${polled.jobId.take(8)} COMPLETED · ~\$0.0001 test credit"
-                        } else {
-                            "Jobs: last ${polled.jobId.take(8)} $status"
-                        }
-                        updateStatus(hint)
+                        val resp = repo.submitResult(polled.jobId, result)
+                        updateStatus(JobRepository.submitHint(polled.jobId, status, resp))
                         backoffMs = BASE_POLL_MS
                     }
                 } catch (e: BenchmarkRunner.Aborted) {
@@ -127,6 +123,31 @@ object JobLoop {
                 val jitter = Random.nextLong(0, (backoffMs * 0.5).toLong().coerceAtLeast(1))
                 delay(backoffMs + jitter)
             }
+        }
+    }
+
+    /** Runs the job while renewing its lease in the background (spec §71). */
+    private suspend fun executeWithLease(
+        repo: JobRepository,
+        polled: JobRepository.PolledJob,
+        lease: JobRepository.Lease?,
+    ): org.json.JSONObject = coroutineScope {
+        val renewer = lease?.let { l ->
+            launch {
+                while (isActive) {
+                    delay(l.renewEverySeconds * 1000L)
+                    val renewed = runCatching { repo.renewLease(polled.jobId, l.leaseId) }.getOrNull()
+                    if (renewed == null) {
+                        android.util.Log.w("FarmosJob", "Lease ${l.leaseId.take(8)} lost; server will requeue")
+                        break
+                    }
+                }
+            }
+        }
+        try {
+            repo.executeJob(polled)
+        } finally {
+            renewer?.cancel()
         }
     }
 

@@ -35,7 +35,13 @@ LIGHT_WORKLOADS = {
     JobType.MONITOR.value,
     JobType.API_REQUEST.value,
 }
-HEAVY_WORKLOADS = {JobType.DATA_TRANSFORM.value, JobType.BENCHMARK.value}
+HEAVY_WORKLOADS = {
+    JobType.DATA_TRANSFORM.value,
+    JobType.BENCHMARK.value,
+    JobType.CHECKSUM.value,
+    JobType.COMPRESSION.value,
+    JobType.JSON_TRANSFORM.value,
+}
 
 # Android BatteryManager health strings that indicate a hardware fault.
 BATTERY_FAULTS = {"DEAD", "OVER_VOLTAGE", "UNSPECIFIED_FAILURE"}
