@@ -1,127 +1,84 @@
-"""Wallet endpoints for FARMOS."""
+"""Wallet endpoints: EIP-191 / SIWE ownership verification (spec §21, §22, §27).
 
-from datetime import datetime, timezone
-from typing import Any
-from uuid import uuid4
+Users never send a seed phrase or private key. They sign a non-transaction
+message in their own wallet; the backend recovers the address.
+"""
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.db.models.core import Wallet
-from app.db.models.enums import WalletChainFamily
 from app.db.session import get_db
-from app.security.signatures import (
-    generate_nonce,
-    generate_challenge_message,
-    verify_sha256,
-)
-from app.logging import get_logger
 from app.dependencies import get_current_user
+from app.services.finance import wallets as wsvc
+from app.services.finance.controls import FinanceError
 
-logger = get_logger(__name__)
 router = APIRouter()
 
 
-class WalletConnectRequest(BaseModel):
-    network: str
-    chain_family: str
-    address: str
+class ChallengeRequest(BaseModel):
+    address: str = Field(min_length=40, max_length=64)
+    network: str = "base-sepolia"
+    label: str | None = Field(default=None, max_length=100)
 
 
-class VerifySignatureRequest(BaseModel):
-    challenge_id: str
-    signature: str
+class VerifyRequest(BaseModel):
+    challenge_id: UUID
+    signature: str = Field(min_length=130, max_length=140)
 
 
-@router.post("/connect-request")
-async def connect_wallet_request(
-    req: WalletConnectRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
+def _err(exc: FinanceError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+@router.post("/challenge")
+async def wallet_challenge(req: ChallengeRequest, db: AsyncSession = Depends(get_db),
+                           current_user=Depends(get_current_user)):
+    """Step 1: get a one-time SIWE message to sign with ``personal_sign``."""
     try:
-        chain = WalletChainFamily(req.chain_family)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Unsupported chain family")
-    nonce = generate_nonce()
-    message = generate_challenge_message(
-        account_type="FARMOS-USER",
-        account_id=str(current_user.id),
-        wallet_address=req.address,
-        nonce=nonce,
-    )
-    challenge_id = str(uuid4())
-    # Store challenge in a lightweight in-memory map for demo; use DB in production
-    from app.config import settings as _s  # noqa: PLC0415
-    if not hasattr(_s, "_wallet_challenges"):
-        _s._wallet_challenges = {}
-    _s._wallet_challenges[challenge_id] = {
-        "nonce": nonce,
-        "message": message,
-        "user_id": str(current_user.id),
-        "chain_family": req.chain_family,
-        "network": req.network,
-        "address": req.address,
-        "expires_at": datetime.now(timezone.utc).timestamp() + 300,
-    }
-    return {
-        "challenge_id": challenge_id,
-        "message": message,
-        "expires_at": (datetime.now(timezone.utc).timestamp() + 300),
-    }
-
-
-@router.post("/verify-signature")
-async def verify_signature(
-    req: VerifySignatureRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    challenges = getattr(settings, "_wallet_challenges", {})
-    challenge = challenges.get(req.challenge_id)
-    if not challenge:
-        raise HTTPException(status_code=400, detail="Invalid challenge")
-    if challenge["user_id"] != str(current_user.id):
-        raise HTTPException(status_code=403, detail="Challenge does not belong to user")
-    expected = challenge["message"].encode()
-    # In production, recover address from signature and compare to challenge address
-    if not verify_sha256(req.signature, "sha256:" + __import__("hashlib").sha256(expected).hexdigest()):
-        raise HTTPException(status_code=400, detail="Signature verification failed")
-    wallet = Wallet(
-        user_id=current_user.id,
-        chain_family=WalletChainFamily(challenge["chain_family"]),
-        network=challenge["network"],
-        address=challenge["address"],
-        label="Default Wallet",
-        is_verified=True,
-        is_default=True,
-        verified_at=datetime.now(timezone.utc),
-    )
-    db.add(wallet)
+        wallet, ch = await wsvc.issue_challenge(db, user=current_user, address=req.address, network=req.network,
+                                                label=req.label)
+    except FinanceError as exc:
+        raise _err(exc)
     await db.commit()
-    logger.info("wallet_verified", user_id=str(current_user.id), wallet=str(wallet.id))
-    return {"detail": "Wallet verified", "wallet_id": str(wallet.id)}
+    return {"challenge_id": str(ch.id), "wallet_id": str(wallet.id), "address": wallet.address,
+            "network": wallet.network, "chain_id": ch.chain_id, "message": ch.message,
+            "expires_at": ch.expires_at.isoformat(), "method": wsvc.METHOD,
+            "note": "Sign this message in your wallet. It does not authorize any transfer. Never share a seed phrase."}
+
+
+@router.post("/verify")
+async def wallet_verify(req: VerifyRequest, db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
+    """Step 2: submit the signature; the backend recovers and compares the address."""
+    try:
+        ok, wallet, error = await wsvc.verify(db, user=current_user, challenge_id=req.challenge_id,
+                                              signature=req.signature)
+    except FinanceError as exc:
+        await db.rollback()
+        raise _err(exc)
+    await db.commit()  # persist failed-attempt counters as well as successes
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"verification failed: {error}")
+    return {"detail": "Wallet verified", **wsvc.wallet_dict(wallet)}
+
+
+@router.post("/{wallet_id}/default")
+async def wallet_set_default(wallet_id: UUID, db: AsyncSession = Depends(get_db),
+                             current_user=Depends(get_current_user)):
+    try:
+        w = await wsvc.set_default(db, user=current_user, wallet_id=wallet_id)
+    except FinanceError as exc:
+        raise _err(exc)
+    await db.commit()
+    return wsvc.wallet_dict(w)
 
 
 @router.get("/")
-async def list_wallets(
-    db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(Wallet).where(Wallet.user_id == current_user.id))
-    wallets = result.scalars().all()
-    return [
-        {
-            "wallet_id": str(w.id),
-            "chain_family": w.chain_family.value,
-            "network": w.network,
-            "address": w.address,
-            "is_verified": w.is_verified,
-            "is_default": w.is_default,
-            "verified_at": w.verified_at.isoformat() if w.verified_at else None,
-        }
-        for w in wallets
-    ]
+async def list_wallets(db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
+    rows = (await db.execute(select(Wallet).where(Wallet.user_id == current_user.id)
+                             .order_by(Wallet.created_at))).scalars().all()
+    return [wsvc.wallet_dict(w) for w in rows]

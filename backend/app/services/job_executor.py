@@ -40,50 +40,14 @@ async def job_already_credited(db: AsyncSession, job_id: UUID, reference_type: s
     return row is not None
 
 
-async def ensure_device_earnings_accounts(db: AsyncSession, device_id: UUID) -> tuple[UUID, UUID]:
-    """Ensure a device has both test and real earnings ledger accounts.
+async def ensure_device_earnings_accounts(db: AsyncSession, device_id: UUID) -> tuple[UUID, None]:
+    """Device TEST earnings account (chart 9010, TEST book). There is no REAL
+    per-device account: real provider earnings live on provider sub-accounts
+    (2010/2000) and only after revenue confirmation (Phase 4)."""
+    from app.services.finance import ledger
 
-    Returns (test_account_id, real_account_id).
-    """
-    test_account = await db.execute(
-        select(LedgerAccount).where(
-            LedgerAccount.owner_type == "DEVICE",
-            LedgerAccount.owner_id == device_id,
-            LedgerAccount.account_type == LedgerAccountType.DEVICE_EARNINGS_TEST,
-            LedgerAccount.asset == "USD",
-        )
-    )
-    test_account = test_account.scalar_one_or_none()
-    if not test_account:
-        test_account = LedgerAccount(
-            owner_type="DEVICE",
-            owner_id=device_id,
-            account_type=LedgerAccountType.DEVICE_EARNINGS_TEST,
-            asset="USD",
-        )
-        db.add(test_account)
-        await db.flush()
-
-    real_account = await db.execute(
-        select(LedgerAccount).where(
-            LedgerAccount.owner_type == "DEVICE",
-            LedgerAccount.owner_id == device_id,
-            LedgerAccount.account_type == LedgerAccountType.DEVICE_EARNINGS_REAL,
-            LedgerAccount.asset == "USDC",
-        )
-    )
-    real_account = real_account.scalar_one_or_none()
-    if not real_account:
-        real_account = LedgerAccount(
-            owner_type="DEVICE",
-            owner_id=device_id,
-            account_type=LedgerAccountType.DEVICE_EARNINGS_REAL,
-            asset="USDC",
-        )
-        db.add(real_account)
-        await db.flush()
-
-    return test_account.id, real_account.id
+    acct = await ledger.account(db, "9010", ledger.TEST, device_id, asset="USD")
+    return acct.id, None
 
 
 async def execute_job(db: AsyncSession, job: Job, device_id: UUID, result_payload: dict[str, Any]) -> dict[str, Any]:
@@ -323,60 +287,26 @@ async def credit_device_earnings(
     result: JobResult,
     is_real_revenue: bool = False,
 ) -> LedgerEntry:
-    """Credit the device's earnings ledger for a verified job result.
+    """Legacy per-device TEST credit for a verified job (display only).
 
-    - If is_real_revenue=True: credit DEVICE_EARNINGS_REAL (USDC)
-    - If is_real_revenue=False: credit DEVICE_EARNINGS_TEST (USD) — test credits only
+    Posted as a balanced TEST_CREDIT transaction (Dr 9000 issuance / Cr 9010
+    device), idempotent per job (spec §71: no duplicate financial credit).
+    REAL money is never credited here: real provider earnings come only from
+    confirmed revenue (``services.finance.revenue``).
     """
-    job_type = JobType(job.workload_type)
-    config = LEDGER_CONFIG.get(job_type, {"reward_test_usd": 0.0001, "reward_real_usd": 0.001})
+    from app.services.finance import ledger
 
     if is_real_revenue:
-        amount = config["reward_real_usd"]
-        asset = "USDC"
-        account_type = LedgerAccountType.DEVICE_EARNINGS_REAL
-        reference_type = "JOB_RESULT_REAL"
-    else:
-        amount = config["reward_test_usd"]
-        asset = "USD"
-        account_type = LedgerAccountType.DEVICE_EARNINGS_TEST
-        reference_type = "JOB_RESULT_TEST"
-
-    test_account_id, real_account_id = await ensure_device_earnings_accounts(db, device_id)
-    account_id: UUID = real_account_id if is_real_revenue else test_account_id
-
-    # Idempotent: a job is credited at most once per account (spec §71: late or
-    # repeated results never receive duplicate financial credit).
-    existing = (
-        await db.execute(
-            select(LedgerEntry).where(
-                LedgerEntry.account_id == account_id,
-                LedgerEntry.reference_type == reference_type,
-                LedgerEntry.reference_id == job.id,
-            )
-        )
-    ).scalars().first()
-    if existing is not None:
-        return existing
-
-    transaction_id: UUID = uuid4()
-    entry = LedgerEntry(
-        transaction_id=transaction_id,
-        account_id=account_id,
-        direction=LedgerDirection.CREDIT,
-        amount=amount,
-        asset=asset,
-        usd_value=amount,
-        reference_type=reference_type,
-        reference_id=job.id,
-        event_metadata={
-            "job_id": str(job.id),
-            "device_id": str(device_id),
-            "job_type": job.workload_type,
-            "result_id": str(result.id),
-            "is_real_revenue": is_real_revenue,
-        },
+        raise ValueError("REAL device credits are not supported; confirm revenue instead")
+    job_type = JobType(job.workload_type)
+    amount = LEDGER_CONFIG.get(job_type, {"reward_test_usd": 0.0001})["reward_test_usd"]
+    tx, _ = await ledger.post(
+        db, tx_type="TEST_CREDIT", book=ledger.TEST,
+        lines=[ledger.dr("9000", amount, asset="USD"), ledger.cr("9010", amount, device_id, asset="USD")],
+        idempotency_key=f"test-credit:{job.id}:{device_id}", reference_type="JOB_RESULT_TEST", reference_id=job.id,
+        description="legacy device test credit (not real money)",
+        metadata={"job_id": str(job.id), "device_id": str(device_id), "result_id": str(result.id)},
     )
-    db.add(entry)
-    await db.flush()
+    entry = (await db.execute(select(LedgerEntry).where(
+        LedgerEntry.transaction_id == tx.id, LedgerEntry.direction == LedgerDirection.CREDIT))).scalars().first()
     return entry

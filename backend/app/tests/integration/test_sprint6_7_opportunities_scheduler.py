@@ -284,5 +284,5 @@ def test_priority_desc_and_manual_mode(client, admin):
     manual = _create(client, admin, "checksum", CHK, auto_schedule=False)
     assert manual["status"] == "VALIDATED"
     assert manual["job_id"] not in str(_tick(client, admin, manual["job_id"]))
-    q = client.get(f"{BASE}/admin/scheduler/queue", headers=admin).json()
+    q = client.get(f"{BASE}/admin/scheduler/queue?limit=500", headers=admin).json()
     assert any(j["job_id"] == low for j in q["queued"])

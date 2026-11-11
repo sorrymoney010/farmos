@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import RevenueEngine from "./RevenueEngine";
+import { AdminTreasury, ProviderFinance } from "./Finance";
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -218,14 +219,20 @@ export default function Home() {
 
         <Section title="Earnings / ledger">
           <div className="row stats">
-            <div><strong>{Number(earnings.total_ledger_credits ?? earnings.total_credits ?? 0).toFixed(4)}</strong><span>credits</span></div>
-            <div><strong>{Number(earnings.total_ledger_debits ?? earnings.total_debits ?? 0).toFixed(4)}</strong><span>debits</span></div>
-            <div><strong>{Number(earnings.net_position ?? earnings.net ?? 0).toFixed(4)}</strong><span>net</span></div>
+            <div><strong>{Number(earnings.total_ledger_credits ?? earnings.total_credits ?? 0).toFixed(4)}</strong><span>{revenue ? "revenue to date" : "lifetime earned"}</span></div>
+            <div><strong>{Number(earnings.total_ledger_debits ?? earnings.total_debits ?? 0).toFixed(4)}</strong><span>{revenue ? "provider liabilities" : "paid out"}</span></div>
+            <div><strong>{Number(earnings.net_position ?? earnings.net ?? 0).toFixed(4)}</strong><span>{revenue ? "available company funds" : "balance"}</span></div>
           </div>
-          <p className="muted">TEST credits stay separate from REAL USDC in the ledger model.</p>
+          <p className="muted">TEST book (simulated billing / test credits) is kept separate from REAL USDC. Double-entry: every posting balances.</p>
         </Section>
       </div>
 
+      {provider?.provider_id ? (
+        <ProviderFinance apiUrl={apiUrl} authHeaders={authHeaders} refreshKey={refreshKey} Section={Section} Badge={Badge} />
+      ) : null}
+      {revenue ? (
+        <AdminTreasury apiUrl={apiUrl} authHeaders={authHeaders} refreshKey={refreshKey} Section={Section} Badge={Badge} />
+      ) : null}
       {fleet ? (
         <RevenueEngine apiUrl={apiUrl} authHeaders={authHeaders} refreshKey={refreshKey} Section={Section} Badge={Badge} />
       ) : null}
