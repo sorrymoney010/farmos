@@ -64,6 +64,21 @@ class Opportunity(Base):
     expires_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # ── Phase 3: profitability inputs (spec §13, §64) ──
+    workload_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    revenue_usd_per_job: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
+    expected_runtime_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    thermal_intensity: Mapped[float] = mapped_column(Numeric(6, 4), default=0.3, server_default="0.3", nullable=False)
+    repeatability_score: Mapped[float] = mapped_column(Numeric(6, 5), default=0.8, server_default="0.8", nullable=False)
+    expected_payment_days: Mapped[float] = mapped_column(Numeric(8, 2), default=0, server_default="0", nullable=False)
+    normalized_resource_consumption: Mapped[float] = mapped_column(Numeric(6, 4), default=0.5, server_default="0.5", nullable=False)
+    estimated_api_cost_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, server_default="0", nullable=False)
+    expected_network_bytes: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    payload_template: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    disabled_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=True
+    )
 
     jobs: Mapped[list["Job"]] = relationship("Job", back_populates="opportunity")
 
@@ -118,6 +133,9 @@ class Job(Base):
     # Server-only verification data (role, known answers, excluded devices).
     # NEVER sent to devices.
     verification_spec: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    # ── Phase 3: scheduling constraints (never sent to devices) ──
+    # {device_affinity: [ids], min_farm_score, cpu_pct, ram_mb, bandwidth_mbps, tier}
+    constraints: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -180,6 +198,101 @@ class JobAssignment(Base):
 
     job: Mapped["Job"] = relationship("Job", back_populates="assignment")
     device: Mapped["Device"] = relationship("Device", back_populates="job_assignments")
+
+
+class RevenueAdapterRecord(Base):
+    """Registry + kill switch for revenue adapters (spec §14, §57.10, §126-127).
+
+    Every adapter is disableable from admin without a code deployment.
+    """
+
+    __tablename__ = "revenue_adapters"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    category: Mapped[str] = mapped_column(String(100), nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)          # INTERNAL | EXTERNAL
+    simulated: Mapped[bool] = mapped_column(default=False, nullable=False)
+    enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    disabled_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    disabled_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    disabled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    certification_stage: Mapped[str] = mapped_column(String(40), nullable=False, default="SANDBOX")
+    health_status: Mapped[str] = mapped_column(String(20), nullable=False, default="UNKNOWN")
+    health_detail: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    last_health_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_discovery_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_reconcile: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class JobEconomics(Base):
+    """Per-job economics: estimate at match time, actuals after verification (spec §64, §65)."""
+
+    __tablename__ = "job_economics"
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    opportunity_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    adapter_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    device_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="ESTIMATED")  # ESTIMATED|REJECTED|ACTUAL
+    asset_symbol: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    expected_gross_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    expected_adjusted_gross_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    expected_cost_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    expected_net_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    expected_costs: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    expected_runtime_seconds: Mapped[float] = mapped_column(Numeric(12, 3), default=0, nullable=False)
+    opportunity_score: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    device_fit: Mapped[Optional[float]] = mapped_column(Numeric(8, 5), nullable=True)
+    final_score: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
+    score_inputs: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    actual_runtime_seconds: Mapped[Optional[float]] = mapped_column(Numeric(12, 3), nullable=True)
+    actual_gross_usd: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
+    actual_cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
+    actual_net_usd: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
+    actual_costs: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    revenue_state: Mapped[str] = mapped_column(String(30), nullable=False, default="ESTIMATED")
+    estimated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    finalized_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_job_economics_device_id", "device_id"),
+        Index("ix_job_economics_status", "status"),
+    )
+
+
+class DeviceEconomics(Base):
+    """Per-node P&L (spec §18). Aggregates are updated once per verified job."""
+
+    __tablename__ = "device_economics"
+
+    device_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True
+    )
+    purchase_price_usd: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    resale_value_usd: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    maintenance_usd: Mapped[float] = mapped_column(Numeric(12, 4), default=0, nullable=False)
+    active_watts: Mapped[Optional[float]] = mapped_column(Numeric(8, 3), nullable=True)
+    lifetime_gross_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    electricity_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    network_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    infrastructure_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    depreciation_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    other_costs_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    net_usd: Mapped[float] = mapped_column(Numeric(18, 8), default=0, nullable=False)
+    jobs_completed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    runtime_seconds: Mapped[float] = mapped_column(Numeric(14, 3), default=0, nullable=False)
+    first_job_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_job_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
 
 class JobLease(Base):

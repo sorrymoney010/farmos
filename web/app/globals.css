@@ -116,3 +116,9 @@ th { color: #8ee0a6; font-weight: 600; }
 .thermal-orange { background: #8a4b12; }
 .thermal-red, .thermal-cooling { background: #8a1f1f; }
 .thermal-unknown { background: #3f3f46; }
+
+/* Phase 3: revenue engine views */
+.badge-bad { background: #7a2323; }
+.badge-warn { background: #7a5a12; }
+button.danger { background: #a12a2a; }
+td button { margin-left: 6px; padding: 2px 8px; font-size: 12px; }

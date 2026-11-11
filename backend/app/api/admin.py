@@ -399,7 +399,7 @@ async def admin_create_canary(
     if blocked:
         raise HTTPException(status_code=409, detail=f"Dispatch blocked by safety policy: {blocked}")
     job = Job(workload_type=req.workload_type, status=JobStatus.DISPATCHED, priority=100,
-              requested_resources=payload, adapter_id="internal", customer_id=current_user.id,
+              requested_resources=payload, adapter_id="internal_compute", customer_id=current_user.id,
               max_retries=0, retry_count=0,
               verification_spec={"role": vsvc.CANARY, "expected": expected})
     db.add(job)

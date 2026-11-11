@@ -146,4 +146,34 @@ class Settings(BaseSettings):
     VERIFICATION_FAILURE_WINDOW_SECONDS: int = 86400
 
 
+    # ── Phase 3: scheduler (spec §16, §62, §63, §146-148) ────────────────────
+    SCHEDULER_INTERVAL_SECONDS: float = 5.0
+    SCHEDULER_BATCH_LIMIT: int = 100
+    DEVICE_ONLINE_SECONDS: int = 180            # heartbeat freshness for "online"
+    MAX_CONCURRENT_JOBS_PER_DEVICE: int = 1
+    MAX_INFLIGHT_PER_PROVIDER: int = 500        # per-provider cap
+    WORKLOAD_INFLIGHT_CAPS: dict[str, int] = {}  # e.g. {"compression": 50}
+    SCHEDULER_AGING_PER_MINUTE: float = 1.0     # anti-starvation priority boost
+    SCHEDULER_AGING_MAX: float = 200.0
+    JOB_AUTO_SCHEDULE_DEFAULT: bool = True      # new jobs go CREATED->VALIDATED->QUEUED
+
+    # ── Phase 3: profitability (spec §17, §64, §65) ──────────────────────────
+    # All prices are configuration (no live market feeds, no external accounts).
+    POWER_PRICE_KWH_USD: float = 0.15
+    DEVICE_IDLE_WATTS: float = 1.5
+    DEVICE_ACTIVE_WATTS: float = 4.0            # x (0.5 + thermal_intensity)
+    NETWORK_COST_PER_GB_USD: float = 0.01
+    INFRA_COST_PER_JOB_USD: float = 0.00001
+    INFRA_COST_PER_HOUR_USD: float = 0.001
+    PAYOUT_FEE_PCT: float = 0.01                # payment/payout processing on gross
+    DEFAULT_DEVICE_PURCHASE_USD: float = 40.0
+    DEFAULT_DEVICE_RESALE_USD: float = 8.0
+    DEVICE_EXPECTED_LIFETIME_HOURS: float = 8760.0  # active hours over device life
+    BASE_FAILURE_PROBABILITY: float = 0.02
+    PRICE_SNAPSHOT_USD: dict[str, float] = {"USD": 1.0, "USDC": 1.0, "ACU": 0.02}
+    ASSET_VOLATILITY_HAIRCUT: dict[str, float] = {"USD": 0.0, "USDC": 0.0, "ACU": 0.35}
+    ASSET_LIQUIDITY_HAIRCUT: dict[str, float] = {"USD": 0.0, "USDC": 0.0, "ACU": 0.20}
+    UNKNOWN_ASSET_HAIRCUT: float = 0.5          # never rank unknown tokens at face value
+
+
 settings = Settings()

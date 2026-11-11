@@ -251,7 +251,7 @@ async def create_shadow(db: AsyncSession, primary: Job, primary_device: Device, 
     shadow = Job(
         workload_type=primary.workload_type,
         status=JobStatus.DISPATCHED,
-        priority=max(1, int(primary.priority or 100) - 50),
+        priority=int(primary.priority or 100) + 50,  # higher runs first
         requested_resources=job_payload(primary),
         max_runtime_seconds=primary.max_runtime_seconds,
         adapter_id="internal-verification",
@@ -352,6 +352,10 @@ async def finalize(db: AsyncSession, job: Job, result: JobResult, outcome: Outco
         if (auto_credit_test and role == PRIMARY and job.workload_type != JobType.BENCHMARK.value):
             await credit_device_earnings(db, job, result.device_id, result, is_real_revenue=False)
             response["test_earnings_credited"] = True
+        # Actual job economics replace estimates (spec §65), once, PRIMARY work only.
+        if role == PRIMARY and job.workload_type != JobType.BENCHMARK.value:
+            from app.services import economics_service as econ
+            response["economics"] = await econ.finalize_job(db, job, result, now)
     else:
         to = JobStatus.FAILED if outcome.device_failed else JobStatus.INVALID_RESULT
         leases.add_event(db, job.id, JobStatus.VERIFYING.value, to.value,

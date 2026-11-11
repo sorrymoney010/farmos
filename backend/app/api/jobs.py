@@ -42,13 +42,18 @@ from app.security.node_auth import (
     verify_request_signature,
 )
 from app.services import benchmark_service as bench_svc
+from app.services import economics_service as econ
 from app.services import lease_service as leases
+from app.services import opportunity_service as opps
+from app.services import profitability as prof
 from app.services import verification_service as vsvc
 from app.services.device_safety import SCHEDULABLE_STATUSES, dispatch_block_reason
 from app.workloads import cpu_data
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+SYSTEM_WORKLOADS = {"benchmark"}
 
 
 # ── Shared request models ─────────────────────────────────────────────────────
@@ -61,7 +66,11 @@ class JobCreateRequest(BaseModel):
     max_runtime_seconds: int | None = Field(default=None, ge=1, le=86400)
     max_retries: int | None = Field(default=None, ge=0, le=10)
     priority: int = 100
-    device_id: UUID | None = None  # optional: dispatch to specific device
+    device_id: UUID | None = None  # optional: device affinity (scheduler only picks this device)
+    opportunity_id: UUID | None = None
+    constraints: dict[str, Any] = Field(default_factory=dict)  # device_affinity, min_farm_score, ram_mb, tier
+    deadline_at: datetime | None = None
+    auto_schedule: bool | None = None  # default JOB_AUTO_SCHEDULE_DEFAULT
 
 
 class JobDispatchRequest(BaseModel):
@@ -156,6 +165,34 @@ async def create_job(
     else:
         scoped_key = None
 
+    # ── Opportunity + adapter kill switch (spec §13/§14) ──
+    opp = None
+    if req.opportunity_id is not None:
+        opp = await opps.get_opportunity(db, req.opportunity_id)
+        if opp is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Opportunity not found")
+        if opp.workload_type and opp.workload_type != job_type:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Opportunity runs {opp.workload_type}, not {job_type}")
+    elif job_type not in SYSTEM_WORKLOADS:
+        opp = await opps.internal_opportunity(db, job_type)
+    adapter_id = opp.adapter_id if opp is not None else opps.INTERNAL_ADAPTER_ID
+    if not await opps.adapter_enabled(db, adapter_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Adapter {adapter_id} is disabled (kill switch)")
+    blocked = opps.opportunity_block_reason(opp, datetime.now(timezone.utc))
+    if blocked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Opportunity unavailable: {blocked}")
+
+    constraints = {k: v for k, v in (req.constraints or {}).items()
+                   if k in {"device_affinity", "min_farm_score", "ram_mb", "cpu_pct", "bandwidth_mbps", "tier"}}
+    if req.device_id is not None:
+        constraints["device_affinity"] = [str(req.device_id)]
+    if req.expected_revenue_usd is not None:
+        constraints["customer_price_usd"] = float(req.expected_revenue_usd)
+    if "tier" in constraints and str(constraints["tier"]).upper() not in prof.TIER_MULTIPLIER:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tier must be STANDARD|PRIORITY|ENTERPRISE")
+
     job = Job(
         workload_type=job_type,
         status=JobStatus.CREATED,
@@ -168,15 +205,47 @@ async def create_job(
         retry_count=0,
         idempotency_key=scoped_key,
         verification_spec={"role": vsvc.PRIMARY},
-        adapter_id="internal",
+        constraints=constraints,
+        deadline_at=req.deadline_at,
+        opportunity_id=opp.id if opp is not None else None,
+        adapter_id=adapter_id,
         customer_id=current_user.id,
     )
     db.add(job)
     await db.flush()
     leases.add_event(db, job.id, None, JobStatus.CREATED.value, actor_type=JobEventActorType.USER,
                      actor_id=current_user.id)
+
+    # ── Profitability gate (spec §17/§64): reject work that cannot make money ──
+    rejected_reason = None
+    if job_type not in SYSTEM_WORKLOADS:
+        terms = opps.terms_from(opp, job_type, constraints)
+        est = prof.estimate_job(terms, prof.DeviceProfile(), await opps.cost_policy(db),
+                                gross_override=constraints.get("customer_price_usd"),
+                                job_max_runtime=req.max_runtime_seconds)
+        score = prof.score_opportunity(est, terms, prof.DeviceProfile())
+        await econ.record_estimate(db, job, None, est, status="ESTIMATED" if est.profitable else "REJECTED",
+                                   opportunity_score=score, inputs={"reference_device": True})
+        if not est.profitable:
+            rejected_reason = (f"unprofitable: expected net ${est.expected_net_profit_usd:.8f} "
+                               f"(gross ${est.adjusted_gross_usd:.8f} - costs ${est.total_cost_usd:.8f})")
+    if rejected_reason:
+        leases.add_event(db, job.id, JobStatus.CREATED.value, JobStatus.REJECTED.value, reason=rejected_reason)
+        job.status = JobStatus.REJECTED
+        job.last_error = rejected_reason
+    else:
+        leases.add_event(db, job.id, JobStatus.CREATED.value, JobStatus.VALIDATED.value, reason="payload, adapter and profitability ok")
+        auto = settings.JOB_AUTO_SCHEDULE_DEFAULT if req.auto_schedule is None else req.auto_schedule
+        if auto:
+            leases.add_event(db, job.id, JobStatus.VALIDATED.value, JobStatus.QUEUED.value, reason="queued for scheduler")
+            job.status = JobStatus.QUEUED
+        else:
+            job.status = JobStatus.VALIDATED
     await db.commit()
-    return {**_job_summary(job), "idempotent_replay": False}
+    return {**_job_summary(job), "idempotent_replay": False, "adapter_id": job.adapter_id,
+            "opportunity_id": str(job.opportunity_id) if job.opportunity_id else None,
+            "rejected_reason": rejected_reason,
+            "expected_net_usd": float(job.expected_profit_usd) if job.expected_profit_usd is not None else None}
 
 
 # ── List jobs ─────────────────────────────────────────────────────────────────
@@ -251,11 +320,14 @@ async def dispatch_job(
     job = (await db.execute(select(Job).where(Job.id == req.job_id).with_for_update())).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    if job.status not in {JobStatus.CREATED, JobStatus.QUEUED}:
+    if job.status not in {JobStatus.CREATED, JobStatus.VALIDATED, JobStatus.QUEUED}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Job cannot be dispatched in status {job.status.value}",
         )
+    if vsvc.role_of(job) == vsvc.PRIMARY and not await opps.adapter_enabled(db, job.adapter_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Adapter {job.adapter_id} is disabled (kill switch)")
 
     device = (await db.execute(select(Device).where(Device.id == req.device_id))).scalar_one_or_none()
     if not device:
@@ -266,6 +338,21 @@ async def dispatch_job(
     blocked = dispatch_block_reason(device, job.workload_type, thresholds, now)
     if blocked:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Dispatch blocked by safety policy: {blocked}")
+
+    # Record the device-specific estimate (manual dispatch is an admin override,
+    # so it is not blocked on profitability, but the economics are tracked).
+    if job.workload_type not in SYSTEM_WORKLOADS:
+        opp = await opps.get_opportunity(db, job.opportunity_id) if job.opportunity_id else None
+        terms = opps.terms_from(opp, job.workload_type, job.constraints)
+        hb = (await econ.latest_heartbeats(db, [device.id])).get(device.id)
+        de = (await econ.device_economics_rows(db, [device.id])).get(device.id)
+        profile = econ.device_profile(device, hb, de)
+        est = prof.estimate_job(terms, profile, await opps.cost_policy(db),
+                                gross_override=(job.constraints or {}).get("customer_price_usd"),
+                                job_max_runtime=job.max_runtime_seconds, retry_count=int(job.retry_count or 0))
+        await econ.record_estimate(db, job, device.id, est, opportunity_score=prof.score_opportunity(est, terms, profile),
+                                   fit=prof.device_fit(profile, prof.requirements_for(terms, job.constraints)),
+                                   inputs={"manual_dispatch": True})
 
     assignment = JobAssignment(job_id=job.id, device_id=req.device_id, assigned_at=now)
     db.add(assignment)
@@ -346,7 +433,7 @@ async def device_poll_next_job(
         await db.execute(
             select(Job).join(JobAssignment)
             .where(JobAssignment.device_id == device.id, Job.status == JobStatus.DISPATCHED)
-            .order_by(Job.priority, Job.created_at).limit(1)
+            .order_by(Job.priority.desc(), Job.created_at).limit(1)
         )
     ).scalar_one_or_none()
     if not job:
