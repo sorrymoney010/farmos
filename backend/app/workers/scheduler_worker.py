@@ -16,7 +16,23 @@ from app.services import scheduler_service as sched
 logger = get_logger(__name__)
 
 
+async def deployments_tick_once() -> dict:
+    """Sprint 16: create due customer-deployment runs, release reservations of
+    failed runs, deliver customer webhooks."""
+    from app.services.developer import deployments
+    async with AsyncSessionLocal() as db:
+        report = await deployments.tick(db)
+        await db.commit()
+        return report
+
+
 async def tick_once() -> dict:
+    try:
+        dep = await deployments_tick_once()
+        if dep.get("runs_created") or dep.get("resumed") or (dep.get("settlement") or {}).get("released"):
+            logger.info("deployments_tick", **{k: v for k, v in dep.items() if not isinstance(v, dict)})
+    except Exception:  # a bad deployment tick must not block dispatching
+        logger.exception("deployments_tick_failed")
     async with AsyncSessionLocal() as db:
         report = await sched.scheduler_tick(db)
         await db.commit()

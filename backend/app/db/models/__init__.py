@@ -8,3 +8,4 @@ from app.db.models.jobs_ledger import *
 from app.db.models.audit import *
 from app.db.models.finance import *
 
+from app.db.models.developer import *

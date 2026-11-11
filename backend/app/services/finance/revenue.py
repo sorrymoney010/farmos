@@ -33,6 +33,7 @@ from app.db.models.core import Provider, SystemSettings
 from app.db.models.devices import Device
 from app.db.models.enums import AuditEventType
 from app.db.models.jobs_ledger import Job, JobEconomics
+from app.db.models.developer import CustomerJobCharge
 from app.services.finance import controls, ledger
 from app.services.finance.controls import FinanceError
 from app.services.finance.ledger import ZERO, d
@@ -167,8 +168,20 @@ async def confirm_revenue(db: AsyncSession, *, job_ids: list | None = None, limi
             report["skipped"][jid] = "no device"
             continue
         job = (await db.execute(select(Job).where(Job.id == row.job_id))).scalar_one()
-        conf = source.confirm(row)
-        row.confirmation_source, row.confirmation_ref, row.ledger_book = source.name, conf.reference, source.book
+        # Sprint 16: jobs from customer deployments confirm from the real billing
+        # event (the prepaid charge), never from the simulated source.
+        charge = (await db.execute(select(CustomerJobCharge).where(
+            CustomerJobCharge.job_id == row.job_id))).scalar_one_or_none()
+        if charge is not None and charge.status != "CHARGED":
+            report["skipped"][jid] = f"customer charge {charge.status.lower()}"
+            continue
+        if charge is not None:
+            src_name, book, prepaid = "customer_prepaid", charge.book, True
+            conf = BillingConfirmation("CONFIRMED", d(charge.charged_usd or 0), f"PREPAID-{charge.id}")
+        else:
+            src_name, book, prepaid = source.name, source.book, False
+            conf = source.confirm(row)
+        row.confirmation_source, row.confirmation_ref, row.ledger_book = src_name, conf.reference, book
         if conf.status == "DISPUTED":
             row.revenue_state = "DISPUTED"
             report["disputed"].append(jid)
@@ -187,19 +200,21 @@ async def confirm_revenue(db: AsyncSession, *, job_ids: list | None = None, limi
             if farmos > ZERO:
                 lines.append(ledger.cr(revenue_code(row.adapter_id, job.workload_type), farmos))
             meta = {"job_id": jid, "adapter_id": row.adapter_id, "workload_type": job.workload_type,
-                    "split": split, "source": source.name, "reference": conf.reference,
+                    "split": split, "source": src_name, "reference": conf.reference,
                     "device_id": str(device.id), "prior_state": row.revenue_state}
-            tx, _ = await ledger.post(db, tx_type="JOB_REVENUE_CONFIRMED", book=source.book, lines=lines,
+            tx, _ = await ledger.post(db, tx_type="JOB_REVENUE_CONFIRMED", book=book, lines=lines,
                                       idempotency_key=f"revenue:{jid}", reference_type="JOB", reference_id=row.job_id,
                                       description=f"confirmed {job.workload_type} revenue", actor_id=actor_id,
                                       actor_type="ADMIN" if actor_id else "SYSTEM", metadata=meta)
-            # Simulated settlement: the (simulated) customer payment / token conversion reaches treasury.
-            settle_type = "TOKEN_CONVERSION" if clearing == "1030" else "CUSTOMER_JOB_CHARGE"
-            await ledger.post(db, tx_type=settle_type, book=source.book,
-                              lines=[ledger.dr("1000", gross), ledger.cr(clearing, gross)],
-                              idempotency_key=f"settle:{jid}", reference_type="JOB", reference_id=row.job_id,
-                              description="simulated billing settlement", metadata={"reference": conf.reference})
-            await chain.deposit(db, settings.PAYOUT_HOT_WALLET_ADDRESS, "USDC", gross, f"settle:{jid}")
+            if not prepaid:
+                # Simulated settlement: the (simulated) customer payment / token conversion reaches treasury.
+                # (Prepaid jobs were already funded via Stripe -> 1050 and charged 2020 -> 1020.)
+                settle_type = "TOKEN_CONVERSION" if clearing == "1030" else "CUSTOMER_JOB_CHARGE"
+                await ledger.post(db, tx_type=settle_type, book=book,
+                                  lines=[ledger.dr("1000", gross), ledger.cr(clearing, gross)],
+                                  idempotency_key=f"settle:{jid}", reference_type="JOB", reference_id=row.job_id,
+                                  description="simulated billing settlement", metadata={"reference": conf.reference})
+                await chain.deposit(db, settings.PAYOUT_HOT_WALLET_ADDRESS, "USDC", gross, f"settle:{jid}")
         row.revenue_state = "CONFIRMED"
         row.confirmed_at = now
         row.confirmed_gross_usd = gross
@@ -210,9 +225,9 @@ async def confirm_revenue(db: AsyncSession, *, job_ids: list | None = None, limi
             row.earnings_available_at = now
         db.add(AuditLog(event_type=AuditEventType.REVENUE_CONFIRMED, actor_type="ADMIN" if actor_id else "SYSTEM",
                         actor_id=actor_id, target_type="JOB", target_id=row.job_id,
-                        event_metadata={"gross": str(gross), "provider_share": str(p_amt), "book": source.book,
-                                        "reference": conf.reference}))
-        report["confirmed"].append({"job_id": jid, "gross": str(gross), "provider_share": str(p_amt),
+                        event_metadata={"gross": str(gross), "provider_share": str(p_amt), "book": book,
+                                        "reference": conf.reference, "source": src_name}))
+        report["confirmed"].append({"job_id": jid, "gross": str(gross), "book": book, "source": src_name, "provider_share": str(p_amt),
                                     "infrastructure": str(infra), "farmos": str(farmos),
                                     "provider_id": str(device.provider_id)})
     await db.flush()
