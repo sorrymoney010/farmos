@@ -151,19 +151,33 @@ export default function Home() {
                 <th>Human ID</th>
                 <th>Status</th>
                 <th>Last seen</th>
-                <th>Score</th>
+                <th>FarmScore</th>
+                <th>Thermal</th>
+                <th>Battery</th>
+                <th>Safety</th>
               </tr>
             </thead>
             <tbody>
               {devices.length === 0 ? (
-                <tr><td colSpan={4} className="muted">No devices yet — mint a claim code and enroll over Wi‑Fi.</td></tr>
+                <tr><td colSpan={7} className="muted">No devices yet — mint a claim code and enroll over Wi‑Fi.</td></tr>
               ) : (
                 devices.map((d) => (
                   <tr key={d.device_id}>
                     <td className="mono">{d.human_id || d.device_id}</td>
                     <td><span className={`badge ${d.status === "ACTIVE" ? "badge-ok" : ""}`}>{d.status}</span></td>
                     <td className="muted">{d.last_seen_at || "—"}</td>
-                    <td>{d.farm_score ?? "—"}</td>
+                    <td>{d.farm_score != null ? Number(d.farm_score).toFixed(1) : "—"}</td>
+                    <td>
+                      <span className={`badge thermal-${(d.temperature_state || "UNKNOWN").toLowerCase()}`}>
+                        {d.temperature_state || "UNKNOWN"}
+                      </span>
+                      {d.temperature_c != null ? ` ${Number(d.temperature_c).toFixed(1)}°C` : ""}
+                    </td>
+                    <td className="muted">
+                      {d.battery_pct != null ? `${Math.round(d.battery_pct)}%` : "—"}
+                      {d.charging ? " ⚡" : ""}
+                    </td>
+                    <td className="muted">{d.safety_paused ? `paused: ${d.safety_reason || "policy"}` : "ok"}</td>
                   </tr>
                 ))
               )}

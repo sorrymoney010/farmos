@@ -210,7 +210,12 @@ def test_expired_timestamp_rejected(client, admin_token):
     assert "outside allowed skew" in resp.text
 
 
-def test_valid_node_token_heartbeat_flips_active(client, admin_token):
+def test_valid_node_token_heartbeat_flips_active(client, admin_token, monkeypatch):
+    # Legacy behaviour (benchmark gate disabled). Sprint 3 gate is covered in
+    # test_sprint3_benchmarks_safety.py.
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "BENCHMARK_REQUIRED_FOR_ACTIVE", False)
     token = _issue_enrollment_token(client, admin_token)
     enroll_resp, key, _payload = _enroll(client, admin_token, token)
     assert enroll_resp.status_code == 200

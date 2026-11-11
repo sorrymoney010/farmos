@@ -2,6 +2,9 @@ package com.farmos.node.node
 
 import android.content.Context
 import com.farmos.node.identity.DeviceIdentityStore
+import com.farmos.node.safety.DeviceTelemetry
+import com.farmos.node.safety.NodeSafetyState
+import com.farmos.node.safety.ServerSafety
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -66,8 +69,8 @@ class NodeEnrollmentRepository(
                     .put("android_version", android.os.Build.VERSION.RELEASE)
                     .put("architecture", android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown")
                     .put("cpu_cores", Runtime.getRuntime().availableProcessors())
-                    .put("ram_mb", 4096)
-                    .put("storage_total_mb", 64000)
+                    .put("ram_mb", DeviceTelemetry.read(context).ramTotalMb ?: 0)
+                    .put("storage_total_mb", DeviceTelemetry.read(context).storageTotalMb ?: 0L)
                     .put("capabilities", JSONArray(listOf("cpu_compute", "network", "storage"))),
             )
             .put("request_nonce", nonce())
@@ -81,30 +84,40 @@ class NodeEnrollmentRepository(
         val deviceId = identityStore.deviceId() ?: error("Device not enrolled")
         val nodeToken = identityStore.nodeToken() ?: error("No node token")
         android.util.Log.i(" FarmosHb", "heartbeatOnce: deviceId=$deviceId nodeToken=${nodeToken.take(8)}...")
-        // Build the body that will be sent (includes extra fields for the API).
-        val payload = JSONObject()
-            .put("observed_at", Instant.now().toString())
-            .put("battery_pct", 80.0)
-            .put("charging", true)
-            .put("temperature_c", 32.0)
-            .put("cpu_util_pct", 10.0)
-            .put("ram_used_mb", 1024)
-            .put("storage_free_mb", 32000)
-            .put("network", JSONObject().put("type", "wifi").put("down_mbps", 100.0).put("up_mbps", 20.0))
-            .put("app_version", "1.0")
+        // REAL telemetry from platform APIs (no hard-coded values). Unknown fields
+        // are omitted entirely: the backend verifies the signature over exactly
+        // the fields sent (model_dump exclude_unset), so omission is safe, and its
+        // safety governor treats missing temperature conservatively.
+        // Floats are rounded to 1 decimal so Kotlin/Python canonical forms match.
+        val snap = DeviceTelemetry.read(context)
+        NodeSafetyState.lastSnapshot = snap
+        val payload = JSONObject().put("observed_at", Instant.now().toString())
+        snap.batteryPct?.let { payload.put("battery_pct", it) }
+        snap.charging?.let { payload.put("charging", it) }
+        snap.temperatureC?.let { payload.put("temperature_c", it) }
+        snap.batteryTemperatureC?.let { payload.put("battery_temperature_c", it) }
+        snap.batteryHealth?.let { payload.put("battery_health", it) }
+        snap.thermalStatus?.let { payload.put("thermal_status", it) }
+        snap.ramUsedMb?.let { payload.put("ram_used_mb", it) }
+        snap.storageFreeMb?.let { payload.put("storage_free_mb", it) }
+        val network = JSONObject()
+        snap.networkType?.let { network.put("type", it) }
+        snap.downMbps?.let { network.put("down_mbps", it) }  // ints only (canonical-safe)
+        snap.upMbps?.let { network.put("up_mbps", it) }
+        if (network.length() > 0) payload.put("network", network)
+        payload.put("app_version", APP_VERSION)
             .put("request_nonce", nonce())
             .put("request_timestamp", Instant.now().toString())
-        // The backend verifies the signature over the HeartbeatRequest model fields
-        // via model_dump(mode="json", exclude={"signature"}) — which includes ALL
-        // fields except signature: observed_at, battery_pct, charging, temperature_c,
-        // cpu_util_pct, ram_used_mb, storage_free_mb, network, app_version,
-        // request_nonce, request_timestamp. So we sign the FULL payload minus the
-        // signature field itself (which is exactly what canonicalize does on the
-        // payload as built above — same keys, same values, sorted).
         payload.put("signature", identityStore.signJsonObject(payload))
         android.util.Log.i(" FarmosHb", "heartbeatOnce: POST $deviceId/heartbeat")
         val result = postJson("/api/v1/devices/$deviceId/heartbeat", payload, nodeToken)
         android.util.Log.i(" FarmosHb", "heartbeatOnce: OK ${result.optString("status","?")}")
+        NodeSafetyState.updateFromServer(
+            safety = parseSafety(result.optJSONObject("safety")),
+            status = result.optString("status", "UNKNOWN"),
+            benchmarkRequired = result.optBoolean("benchmark_required", false),
+            farmScore = if (result.isNull("farm_score")) null else result.optDouble("farm_score"),
+        )
         result
     }
 
@@ -137,8 +150,22 @@ class NodeEnrollmentRepository(
         }
     }
 
+    private fun parseSafety(o: JSONObject?): ServerSafety? = o?.let {
+        ServerSafety(
+            temperatureState = it.optString("temperature_state", "UNKNOWN"),
+            workloadClass = it.optString("workload_class", "LIGHT"),
+            paused = it.optBoolean("paused", false),
+            reason = if (it.isNull("reason")) null else it.optString("reason"),
+            emergencyStop = it.optBoolean("emergency_stop", false),
+        )
+    }
+
     private fun nonce(): String = UUID.randomUUID().toString().replace("-", "")
     private fun uuidSha(): String = nonce()
+
+    companion object {
+        const val APP_VERSION = "1.1.0"
+    }
 
     data class EnrollmentResult(
         val deviceId: String,

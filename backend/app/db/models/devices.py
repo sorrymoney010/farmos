@@ -53,6 +53,17 @@ class Device(Base):
     )
     farm_score: Mapped[Optional[float]] = mapped_column(Numeric(8, 4), nullable=True)
     reputation_score: Mapped[float] = mapped_column(Numeric(8, 4), default=50.0, nullable=False)
+    # ── Sprint 3 health/safety state (spec §10, §60, §62) ──
+    temperature_state: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    safety_paused: Mapped[bool] = mapped_column(default=False, nullable=False)
+    safety_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    cooldown_until: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_temperature_c: Mapped[Optional[float]] = mapped_column(Numeric(5, 2), nullable=True)
+    last_battery_pct: Mapped[Optional[float]] = mapped_column(Numeric(5, 2), nullable=True)
+    last_charging: Mapped[Optional[bool]] = mapped_column(nullable=True)
+    battery_health: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     last_seen_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
