@@ -17,6 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -260,6 +261,16 @@ class JobEconomics(Base):
     revenue_state: Mapped[str] = mapped_column(String(30), nullable=False, default="ESTIMATED")
     estimated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     finalized_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Phase 4: revenue confirmation (UNCONFIRMED/SIMULATED -> CONFIRMED|DISPUTED) and split.
+    ledger_book: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    confirmation_source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    confirmation_ref: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    confirmed_gross_usd: Mapped[Optional[float]] = mapped_column(Numeric(30, 12), nullable=True)
+    provider_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    provider_share_usd: Mapped[Optional[float]] = mapped_column(Numeric(30, 12), nullable=True)
+    revenue_transaction_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    earnings_available_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_job_economics_device_id", "device_id"),
@@ -415,9 +426,15 @@ class LedgerAccount(Base):
     owner_type: Mapped[str] = mapped_column(String(50), nullable=False)
     owner_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
     account_type: Mapped[LedgerAccountType] = mapped_column(
-        Enum(LedgerAccountType, native_enum=False), nullable=False
+        Enum(LedgerAccountType, native_enum=False, length=40), nullable=False
     )
     asset: Mapped[str] = mapped_column(String(20), nullable=False)
+    # Phase 4 chart of accounts (spec §99). Legacy per-device test accounts have code 9010.
+    code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    category: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)   # ASSET|LIABILITY|REVENUE|EXPENSE|RESERVE|CONTRA
+    normal_side: Mapped[Optional[str]] = mapped_column(String(6), nullable=True)  # DEBIT|CREDIT
+    book: Mapped[str] = mapped_column(String(10), nullable=False, default="TEST", server_default="TEST")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -429,6 +446,8 @@ class LedgerAccount(Base):
     __table_args__ = (
         Index("ix_ledger_accounts_owner", "owner_type", "owner_id"),
         Index("ix_ledger_accounts_type_asset", "account_type", "asset"),
+        Index("uq_ledger_accounts_chart", "book", "code", "owner_type", "owner_id", "asset", unique=True,
+              postgresql_where=text("code IS NOT NULL")),
     )
 
 
@@ -453,6 +472,7 @@ class LedgerEntry(Base):
     reference_type: Mapped[str] = mapped_column(String(50), nullable=False)
     reference_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
     event_metadata: Mapped[Any] = mapped_column("metadata", JSON, default=dict, nullable=False)
+    book: Mapped[str] = mapped_column(String(10), nullable=False, default="TEST", server_default="TEST")
     posted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -463,6 +483,7 @@ class LedgerEntry(Base):
         Index("ix_ledger_entries_transaction", "transaction_id"),
         Index("ix_ledger_entries_reference", "reference_type", "reference_id"),
         Index("ix_ledger_entries_posted_at", "posted_at"),
+        Index("ix_ledger_entries_account", "account_id"),
     )
 
 
@@ -502,8 +523,29 @@ class Withdrawal(Base):
     )
     tx_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     failure_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Phase 4 controls (spec §27, §74, §106-§111, §149)
+    book: Mapped[str] = mapped_column(String(10), nullable=False, default="TEST", server_default="TEST")
+    requested_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    recipient_address: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    chain_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    amount_atomic: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    risk_decision: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    risk_reasons: Mapped[Any] = mapped_column(JSON, default=list, nullable=False)
+    approvals: Mapped[Any] = mapped_column(JSON, default=list, nullable=False)
+    required_approvals: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    approval_hash: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    hold_transaction_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    settle_transaction_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    release_transaction_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    payout_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    decided_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=True
+    )
 
     __table_args__ = (
+        UniqueConstraint("provider_id", "idempotency_key", name="uq_withdrawal_idempotency"),
         Index("ix_withdrawals_provider_id", "provider_id"),
         Index("ix_withdrawals_status", "status"),
         Index("ix_withdrawals_requested_at", "requested_at"),
@@ -517,8 +559,10 @@ class ProviderBalance(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     provider_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("providers.id", ondelete="CASCADE"), unique=True, nullable=False
+        UUID(as_uuid=True), ForeignKey("providers.id", ondelete="CASCADE"), nullable=False
     )
+    book: Mapped[str] = mapped_column(String(10), nullable=False, default="TEST", server_default="TEST")
+    asset: Mapped[str] = mapped_column(String(20), nullable=False, default="TEST_USD", server_default="TEST_USD")
     pending_balance: Mapped[float] = mapped_column(Numeric(30, 12), default=0.0, nullable=False)
     available_balance: Mapped[float] = mapped_column(Numeric(30, 12), default=0.0, nullable=False)
     held_balance: Mapped[float] = mapped_column(Numeric(30, 12), default=0.0, nullable=False)
@@ -529,5 +573,6 @@ class ProviderBalance(Base):
     )
 
     __table_args__ = (
+        UniqueConstraint("provider_id", "book", name="uq_provider_balance_book"),
         Index("ix_provider_balances_provider_id", "provider_id"),
     )

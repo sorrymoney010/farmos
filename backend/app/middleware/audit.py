@@ -21,7 +21,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
         ("POST", "/api/v1/auth/login"): AuditEventType.USER_LOGIN,
         ("POST", "/api/v1/auth/logout"): AuditEventType.USER_LOGOUT,
         ("POST", "/api/v1/auth/register"): AuditEventType.USER_REGISTERED,
-        ("POST", "/api/v1/wallets/verify-signature"): AuditEventType.WALLET_VERIFIED,
+        # wallet verification is audited in services/finance/wallets.py (success and failure)
         ("POST", "/api/v1/devices/enroll"): AuditEventType.DEVICE_ENROLLED,
         ("POST", "/api/v1/admin/devices/{device_id}/quarantine"): AuditEventType.DEVICE_QUARANTINED,
         ("POST", "/api/v1/admin/devices/{device_id}/release"): AuditEventType.DEVICE_RELEASED,

@@ -164,6 +164,10 @@ class Wallet(Base):
     verified_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Phase 4 (spec §21, §27): how ownership was proven + payout-change cooldown.
+    chain_id: Mapped[Optional[int]] = mapped_column(nullable=True)
+    verification_method: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    cooldown_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -194,6 +198,9 @@ class WalletVerificationChallenge(Base):
     )
     nonce: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    chain_id: Mapped[Optional[int]] = mapped_column(nullable=True)
+    failed_attempts: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     consumed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True

@@ -175,5 +175,49 @@ class Settings(BaseSettings):
     ASSET_LIQUIDITY_HAIRCUT: dict[str, float] = {"USD": 0.0, "USDC": 0.0, "ACU": 0.20}
     UNKNOWN_ASSET_HAIRCUT: float = 0.5          # never rank unknown tokens at face value
 
+    # ── Phase 4: ledger, revenue confirmation, wallets, withdrawals, payouts ──
+    # HARD RULES: no real funds, no mainnet, no private keys. Only the simulated
+    # billing source, the mock signer and the simulated payout provider exist.
+    LEDGER_TEST_ASSET: str = "TEST_USD"          # TEST book asset (never USDC)
+    LEDGER_REAL_ASSET: str = "USDC"              # REAL book asset (no source can post here yet)
+    BILLING_SOURCE: str = "simulated"            # only "simulated" is implemented
+    REVENUE_SPLIT_DEFAULT: dict[str, float] = {"provider": 0.65, "infrastructure": 0.15, "farmos": 0.20}
+    REVENUE_SPLIT_OVERRIDES: dict[str, dict[str, float]] = {}  # key: adapter_id or workload_type
+    PROVIDER_EARNINGS_HOLD_HOURS: float = 24.0   # PENDING -> AVAILABLE after confirmation (spec §23/§151)
+    OPERATING_RESERVE_TARGET_USD: float = 0.0    # shown in owner accounting (spec §26)
+    # Wallet verification (spec §21, §27): EIP-191 personal_sign over an EIP-4361 (SIWE) message.
+    WALLET_SIWE_DOMAIN: str = "farmos.local"
+    WALLET_SIWE_URI: str = "https://farmos.local"
+    WALLET_CHALLENGE_TTL_SECONDS: int = 600
+    WALLET_MAX_FAILED_ATTEMPTS: int = 5
+    WALLET_CHANGE_COOLDOWN_HOURS: float = 24.0
+    WALLET_NETWORKS: dict[str, int] = {"base": 8453, "base-sepolia": 84532}  # ownership proof only
+    # Withdrawals (spec §74, §106, §149)
+    WITHDRAWAL_MIN_USD: float = 5.0
+    WITHDRAWAL_MAX_PER_TX_USD: float = 1000.0
+    WITHDRAWAL_DAILY_LIMIT_USD: float = 2000.0
+    WITHDRAWAL_NEW_ACCOUNT_DAYS: int = 7
+    WITHDRAWAL_NEW_ACCOUNT_DAILY_LIMIT_USD: float = 100.0
+    WITHDRAWAL_STANDARD_HOLD_HOURS: float = 1.0
+    WITHDRAWAL_EXTENDED_HOLD_HOURS: float = 72.0
+    WITHDRAWAL_LARGE_USD: float = 500.0          # needs two distinct approvers
+    WITHDRAWAL_ALLOW_SELF_APPROVAL: bool = False
+    WITHDRAWAL_REAL_BOOK_ENABLED: bool = False   # REAL USDC withdrawals are refused in this build
+    # Payouts (spec §107-§111): simulated provider + mock signer only.
+    PAYOUT_PROVIDER: str = "simulated"
+    PAYOUT_SIGNER: str = "mock"
+    PAYOUT_NETWORKS: dict[str, int] = {"base-sepolia": 84532}  # testnet label; mainnet is hard-blocked
+    PAYOUT_CONFIRMATIONS_REQUIRED: int = 3
+    PAYOUT_BATCH_SIZE: int = 50
+    PAYOUT_DAILY_LIMIT_USD: float = 5000.0
+    PAYOUT_MAX_TX_USD: float = 1000.0
+    PAYOUT_HOT_WALLET_ADDRESS: str = "0x000000000000000000000000000000000000F4A1"  # simulated only
+    TOKEN_REGISTRY: dict[str, dict] = {
+        "USDC": {"base-sepolia": {"chain_id": 84532, "decimals": 6, "status": "ACTIVE",
+                                  "contract": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                                  "source_of_truth": "Circle testnet docs; re-verify before any non-simulated use"}},
+    }
+    RECONCILIATION_TOLERANCE_USD: float = 0.000001
+
 
 settings = Settings()

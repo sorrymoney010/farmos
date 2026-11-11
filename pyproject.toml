@@ -28,6 +28,7 @@ dependencies = [
     "ecdsa==0.19.1",
     "pydantic-extra-types==2.10.0",
     "email-validator==2.2.0",
+    "eth-account==0.13.4",  # EIP-191/SIWE signature recovery only (no key generation or signing in app code)
 ]
 
 [project.optional-dependencies]

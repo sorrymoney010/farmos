@@ -5,13 +5,13 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.core import User, Provider
 from app.db.models.devices import Device
 from app.db.models.devices import DeviceHeartbeat, DeviceHealthEvent
-from app.db.models.jobs_ledger import Job, LedgerEntry, Withdrawal
+from app.db.models.jobs_ledger import Job, Withdrawal
 from app.db.models.audit import AuditLog
 from app.db.models.enums import (
     DeviceStatus,
@@ -146,19 +146,20 @@ async def admin_revenue(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_roles("OWNER", "ADMIN", "FINANCE")),
 ):
-    # Aggregated ledger summary
-    credit_result = await db.execute(
-        select(func.coalesce(func.sum(LedgerEntry.amount), 0)).where(LedgerEntry.direction == "CREDIT")
-    )
-    debit_result = await db.execute(
-        select(func.coalesce(func.sum(LedgerEntry.amount), 0)).where(LedgerEntry.direction == "DEBIT")
-    )
-    total_credits = float(credit_result.scalar() or 0)
-    total_debits = float(debit_result.scalar() or 0)
+    """Owner accounting summary (spec §26). Under double-entry, global debit/credit sums always
+    net to zero, so report revenue-to-date and provider liabilities per book instead."""
+    from app.services.finance import treasury  # noqa: PLC0415
+
+    test = await treasury.summary(db, "TEST")
+    real = await treasury.summary(db, "REAL")
+    rev = sum(float(v) for v in test["revenue_to_date"].values())
+    liab = float(test["provider_liabilities"]["total"])
     return {
-        "total_ledger_credits": total_credits,
-        "total_ledger_debits": total_debits,
-        "net_position": total_credits - total_debits,
+        "total_ledger_credits": rev,
+        "total_ledger_debits": liab,
+        "net_position": float(test["available_company_funds"]),
+        "test_book": test,
+        "real_book": real,
     }
 
 
