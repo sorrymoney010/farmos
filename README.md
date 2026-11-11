@@ -1,6 +1,14 @@
 # FARMOS — Distributed Edge Revenue Operating System
 
-## Phase 1 Foundation (Current)
+## Current build status — November 11, 2026
+
+Main has progressed through Sprint 10. The historical Phase 1 inventory below is not the current completion checklist. See [current status and coder handoff](docs/CURRENT_BUILD_AND_CODER_HANDOFF.md) for merged work, pending PR #8, review findings, and launch gates.
+
+- Merged: job leases/retries/verification, profitability and scheduling, test ledger/wallets/withdrawals, fleet simulator and adapter hardening.
+- Pending: [PR #8](https://github.com/sorrymoney010/farmos/pull/8), developer deployments and prepaid Stripe test billing.
+- Revenue and payout simulations are not evidence of live earnings. Production operation and real receipts have not been verified in this review.
+
+## Historical Phase 1 Foundation
 
 ### What's implemented
 - Repository scaffold: `backend/`, `web/`, `android-node/`, `sdk/`, `docs/`, `infra/`, `scripts/`
@@ -31,7 +39,7 @@ curl -X POST http://localhost:8000/api/v1/auth/register \
   -d '{"email":"owner@farmos.local","password":"ChangeMe123!","full_name":"Owner"}'
 ```
 
-### Next
+### Historical Phase 1 next steps (superseded by the current handoff)
 - Node simulator (Phase 1 item 9)
 - First Alembic migration validation
 - Unit/integration tests
