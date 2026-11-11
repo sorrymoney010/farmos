@@ -11,7 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select, update
+from sqlalchemy import desc, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -24,6 +24,7 @@ from app.db.models.enums import (
     LedgerAccountType,
     LedgerDirection,
 )
+from app.db.models.core import Role, UserRole
 from app.db.models.devices import Device
 from app.db.models.jobs_ledger import (
     Job,
@@ -142,7 +143,7 @@ def _verification_view(job: Job) -> dict[str, Any] | None:
 async def create_job(
     req: JobCreateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(require_roles("OWNER", "ADMIN", "CUSTOMER")),
+    current_user=Depends(require_roles("OWNER", "ADMIN")),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=128),
 ):
     job_type = req.workload_type
@@ -248,6 +249,21 @@ async def create_job(
             "expected_net_usd": float(job.expected_profit_usd) if job.expected_profit_usd is not None else None}
 
 
+def visible_jobs(user_id: UUID):
+    """Scope before pagination/lookup; customer ownership uses the user UUID.
+
+    Deployment.customer_id is a different (billing account) identifier.
+    Explicit staff roles retain operational access even on multi-role accounts.
+    """
+    staff = (
+        select(UserRole.id)
+        .join(Role, UserRole.role_id == Role.id)
+        .where(UserRole.user_id == user_id, Role.name.in_(("OWNER", "ADMIN", "OPERATIONS")))
+        .exists()
+    )
+    return select(Job).where(or_(Job.customer_id == user_id, staff))
+
+
 # ── List jobs ─────────────────────────────────────────────────────────────────
 
 @router.get("/")
@@ -255,7 +271,7 @@ async def list_jobs(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS", "CUSTOMER")),
 ):
-    result = await db.execute(select(Job).order_by(desc(Job.created_at)).limit(100))
+    result = await db.execute(visible_jobs(current_user.id).order_by(desc(Job.created_at)).limit(100))
     jobs = result.scalars().all()
     return [
         {
@@ -277,7 +293,7 @@ async def get_job(
 ):
     # Eager-load relationships: lazy loading is not allowed under asyncio.
     result = await db.execute(
-        select(Job)
+        visible_jobs(current_user.id)
         .options(selectinload(Job.assignment), selectinload(Job.verification))
         .where(Job.id == job_id)
     )

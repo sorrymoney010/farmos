@@ -173,3 +173,27 @@ printed `whsec_...` into `STRIPE_WEBHOOK_SECRET`, and pay with card
    and the existing withdrawal approvals/limits apply.
 5. Run `GET /admin/developer/reconcile?book=REAL` daily; compare with Stripe balance
    reports (Stripe→bank payouts are not yet ingested; see follow-ups).
+
+## Customer job access hardening — November 11, 2026
+
+Customer JWT requests to `GET /api/v1/jobs/` and `GET /api/v1/jobs/{id}` now
+see only jobs owned by that user. Ownership is filtered in SQL before pagination
+and detail lookup. Another customer's job, an unowned job and an unknown ID all
+return the same 404 response. OWNER, ADMIN and OPERATIONS retain fleet visibility,
+including staff accounts that also hold the CUSTOMER role.
+
+`POST /api/v1/jobs/` is now OWNER/ADMIN only. Customers must submit through
+`POST /api/v1/developer/deployments` so quotes, policy checks and prepaid
+reservations cannot be bypassed through the legacy endpoint. This intentionally
+changes legacy customer clients; switch them to the deployment API.
+
+Validation on this change: 153 backend unit tests passed, including 11 new
+HTTP/SQL authorization regressions in `tests/unit/test_customer_job_access.py`.
+Those regressions use an isolated SQLite database, actual role checks, and an
+overridden identity dependency. They do not replace PostgreSQL integration,
+JWT authentication, migration, physical-device or production validation.
+
+Still open before a paid launch: connection-time egress protection (devices and
+server webhooks), processor settlement/fee reconciliation, a real payout provider,
+and full integration/physical-device evidence. Live billing and withdrawals have
+not been enabled by this change.
