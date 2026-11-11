@@ -120,4 +120,30 @@ class Settings(BaseSettings):
     THERMAL_MODEL_OVERRIDES: dict[str, dict[str, float]] = {}
 
 
+    # ── Phase 2: job leases (spec §71) ───────────────────────────────────────
+    LEASE_ACCEPT_TIMEOUT_SECONDS: int = 120    # DISPATCHED -> must accept within
+    LEASE_DEFAULT_RUNTIME_SECONDS: int = 300   # when job has no max_runtime_seconds
+    LEASE_RUNTIME_BUFFER_SECONDS: int = 60
+    LEASE_GRACE_SECONDS: int = 30
+    LEASE_RENEW_SECONDS: int = 120
+    LEASE_MAX_TOTAL_SECONDS: int = 3600        # hard cap from first accept
+    JOB_DEFAULT_MAX_RETRIES: int = 3
+    LEASE_SWEEP_ON_POLL: bool = True           # opportunistic sweep without a worker
+
+    # ── Phase 2: verification (spec §67) ─────────────────────────────────────
+    VERIFY_ON_SUBMIT: bool = True
+    REDUNDANT_SAMPLE_RATE: float = 0.2         # share of http_check/monitor jobs re-run on a 2nd device
+    REDUNDANT_FALLBACK_SCHEMA: bool = True     # no 2nd device available -> schema-only (LOW confidence)
+    HTTP_CHECK_LATENCY_TOLERANCE_MS: float = 5000.0
+
+    # ── Phase 2: reputation (spec §36) ───────────────────────────────────────
+    REPUTATION_PASS_DELTA: float = 1.0
+    REPUTATION_FAIL_DELTA: float = -10.0
+    REPUTATION_TIMEOUT_DELTA: float = -3.0
+    REPUTATION_CANARY_FAIL_DELTA: float = -25.0
+    REPUTATION_QUARANTINE_BELOW: float = 15.0
+    VERIFICATION_FAILURES_QUARANTINE: int = 3  # failures within the window -> quarantine
+    VERIFICATION_FAILURE_WINDOW_SECONDS: int = 86400
+
+
 settings = Settings()

@@ -164,7 +164,7 @@ class NodeEnrollmentRepository(
     private fun uuidSha(): String = nonce()
 
     companion object {
-        const val APP_VERSION = "1.1.0"
+        const val APP_VERSION = "1.2.0"
     }
 
     data class EnrollmentResult(

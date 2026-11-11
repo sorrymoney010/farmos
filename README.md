@@ -43,3 +43,4 @@ curl -X POST http://localhost:8000/api/v1/auth/register \
 - Staging only: set `STAGING_CLAIM_CODES=true` to accept fixed code `123`
 - Docs: `docs/WIRELESS_ONBOARDING.md`
 - Dashboard: open the web app, paste a bearer token, view devices/jobs/earnings and mint claim codes
+See also: [docs/LEASES_AND_VERIFICATION.md](docs/LEASES_AND_VERIFICATION.md) for job leases, retries/dead-letter, idempotency and independent result verification.

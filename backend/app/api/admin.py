@@ -53,6 +53,7 @@ async def admin_fleet(
                 "charging": d.last_charging,
                 "safety_paused": bool(d.safety_paused),
                 "safety_reason": d.safety_reason,
+                "reputation_score": float(d.reputation_score) if d.reputation_score is not None else None,
                 "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
             }
             for d in devices
@@ -123,6 +124,11 @@ async def release_quarantine(
     device.safety_paused = False
     device.safety_reason = None
     device.cooldown_until = None
+    # Probation: a device quarantined for low reputation restarts just above the floor.
+    from app.config import settings as _settings
+    floor = float(_settings.REPUTATION_QUARANTINE_BELOW) + 5.0
+    if float(device.reputation_score or 0) < floor:
+        device.reputation_score = floor
     event = DeviceHealthEvent(
         device_id=device.id,
         event_type="RELEASE_QUARANTINE",
@@ -264,3 +270,146 @@ async def put_safety_policy(
     ))
     await db.commit()
     return {"policy": policy, "effective_default": effective.as_dict()}
+
+
+# ── Phase 2: leases, dead-letter, canaries ───────────────────────────────────
+
+class CanaryRequest(BaseModel):
+    device_id: str
+    workload_type: str = "checksum"
+    url: str | None = None
+    expected_http_status: int | None = None
+
+
+@router.post("/jobs/sweep-leases")
+async def admin_sweep_leases(
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS")),
+):
+    """Expire overdue leases now: requeue (or dead-letter) their jobs."""
+    from app.services import lease_service as leases
+
+    swept = await leases.sweep_expired(db, limit=500)
+    return {"swept": swept, "count": len(swept)}
+
+
+@router.get("/jobs/dead-letter")
+async def admin_dead_letter(
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS")),
+):
+    rows = (await db.execute(
+        select(Job).where(Job.dead_lettered.is_(True)).order_by(Job.updated_at.desc()).limit(200)
+    )).scalars().all()
+    return {"jobs": [{"job_id": str(j.id), "workload_type": j.workload_type, "status": j.status.value,
+                      "retry_count": j.retry_count, "max_retries": j.max_retries, "last_error": j.last_error,
+                      "parent_job_id": str(j.parent_job_id) if j.parent_job_id else None,
+                      "updated_at": j.updated_at.isoformat()} for j in rows],
+            "total": len(rows)}
+
+
+@router.post("/jobs/{job_id}/requeue")
+async def admin_requeue_dead_letter(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles("OWNER", "ADMIN")),
+):
+    """Explicitly move a dead-lettered job back to QUEUED with a fresh retry budget."""
+    from app.db.models.enums import JobEventActorType
+    from app.services import lease_service as leases
+
+    job = (await db.execute(select(Job).where(Job.id == job_id).with_for_update())).scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.dead_lettered:
+        raise HTTPException(status_code=409, detail="Job is not dead-lettered")
+    await leases.clear_attempt(db, job)
+    leases.add_event(db, job.id, job.status.value, JobStatus.QUEUED.value, reason="admin requeue from dead-letter",
+                     actor_type=JobEventActorType.ADMIN, actor_id=current_user.id)
+    job.status = JobStatus.QUEUED
+    job.dead_lettered = False
+    job.retry_count = 0
+    job.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"job_id": str(job.id), "status": job.status.value}
+
+
+@router.get("/jobs/{job_id}/attempts")
+async def admin_job_attempts(
+    job_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS")),
+):
+    """Lease/attempt history plus the immutable job_event trail."""
+    from app.db.models.jobs_ledger import JobEvent, JobLease
+    from app.services import lease_service as leases
+
+    job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    lease_rows = (await db.execute(
+        select(JobLease).where(JobLease.job_id == job.id).order_by(JobLease.attempt, JobLease.issued_at)
+    )).scalars().all()
+    events = (await db.execute(
+        select(JobEvent).where(JobEvent.job_id == job.id).order_by(JobEvent.id)
+    )).scalars().all()
+    return {
+        "job_id": str(job.id), "status": job.status.value, "retry_count": job.retry_count,
+        "max_retries": job.max_retries, "dead_lettered": job.dead_lettered, "last_error": job.last_error,
+        "role": (job.verification_spec or {}).get("role", "PRIMARY"),
+        "attempts": [{**leases.lease_dict(l), "device_id": str(l.device_id), "result_hash": l.result_hash,
+                      "closed_at": l.closed_at.isoformat() if l.closed_at else None,
+                      "verification": (l.evidence or {}).get("verification")} for l in lease_rows],
+        "events": [{"from": e.from_status, "to": e.to_status, "reason": e.reason,
+                    "actor_type": e.actor_type.value if hasattr(e.actor_type, "value") else e.actor_type,
+                    "at": e.created_at.isoformat() if e.created_at else None} for e in events],
+    }
+
+
+@router.post("/jobs/canary")
+async def admin_create_canary(
+    req: CanaryRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS")),
+):
+    """Dispatch a known-answer spot-check job to a device (spec §67 KNOWN_ANSWER).
+
+    The expected answer is stored server-side only; the job looks like any other
+    job of that type to the device. Canary jobs never earn credit; a wrong answer
+    applies the canary reputation penalty and quarantines the device.
+    """
+    import secrets
+    from app.db.models.enums import JobEventActorType
+    from app.db.models.jobs_ledger import JobAssignment
+    from app.services import benchmark_service as bench_svc
+    from app.services import lease_service as leases
+    from app.services import verification_service as vsvc
+    from app.services.device_safety import dispatch_block_reason
+
+    device = (await db.execute(select(Device).where(Device.id == req.device_id))).scalar_one_or_none()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    try:
+        payload, expected = vsvc.canary_payload_and_expected(
+            req.workload_type, secrets.token_hex(8), req.url, req.expected_http_status)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    now = datetime.now(timezone.utc)
+    blocked = dispatch_block_reason(device, req.workload_type, await bench_svc.thresholds_for_device(db, device), now)
+    if blocked:
+        raise HTTPException(status_code=409, detail=f"Dispatch blocked by safety policy: {blocked}")
+    job = Job(workload_type=req.workload_type, status=JobStatus.DISPATCHED, priority=100,
+              requested_resources=payload, adapter_id="internal", customer_id=current_user.id,
+              max_retries=0, retry_count=0,
+              verification_spec={"role": vsvc.CANARY, "expected": expected})
+    db.add(job)
+    await db.flush()
+    leases.add_event(db, job.id, None, JobStatus.CREATED.value, reason="canary spot-check",
+                     actor_type=JobEventActorType.ADMIN, actor_id=current_user.id)
+    leases.add_event(db, job.id, JobStatus.CREATED.value, JobStatus.DISPATCHED.value,
+                     reason=f"canary to {device.human_id}", actor_type=JobEventActorType.ADMIN, actor_id=current_user.id)
+    db.add(JobAssignment(job_id=job.id, device_id=device.id, assigned_at=now))
+    lease = await leases.issue_lease(db, job, device.id, now)
+    await db.commit()
+    return {"job_id": str(job.id), "device_id": str(device.id), "workload_type": job.workload_type,
+            "status": job.status.value, "lease": leases.lease_dict(lease)}

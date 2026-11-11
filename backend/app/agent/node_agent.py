@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -20,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from app.agent.benchmark import BenchmarkAborted, collect_telemetry, encode_results, run_benchmark
 from app.logging import get_logger
-from app.services.job_executor import execute_job
+from app.agent.executors import result_hash_and_uri, run_workload
 
 # structlog logger: the agent logs with keyword context (stdlib logging rejects kwargs).
 logger = get_logger(__name__)
@@ -267,6 +266,7 @@ class FarmosDeviceAgent:
             json=payload,
         )
         if resp.status_code == 200:
+            self.current_lease = (resp.json() or {}).get("lease")
             logger.info("job_accepted", job_id=job_id)
             return True
         else:
@@ -281,20 +281,48 @@ class FarmosDeviceAgent:
     # ── Job Execution ─────────────────────────────────────────────────────────
 
     async def execute_job(self, job: dict[str, Any]) -> dict[str, Any]:
-        """Execute a job and return the result."""
+        """Execute a job locally (async; CPU work runs in a thread)."""
         workload_type = job.get("workload_type", "http_check")
-        payload = job.get("payload", {})
-
         logger.info("executing_job", job_id=job.get("job_id"), type=workload_type)
+        return await run_workload(workload_type, job.get("payload") or {})
 
-        result = execute_job(
-            None,  # db session not needed for local execution
-            type("Job", (), {"workload_type": workload_type})(),
-            self.device_id or "unknown",
-            payload,
+    async def renew_lease(self, client: httpx.AsyncClient, job_id: str, lease_id: str) -> dict[str, Any] | None:
+        """Extend the lease of a running job (spec §71)."""
+        to_sign = {
+            "request_nonce": uuid4().hex,
+            "request_timestamp": datetime.now(timezone.utc).isoformat(),
+            "job_id": job_id,
+            "device_id": self.device_id,
+            "lease_id": lease_id,
+        }
+        body = {"request_nonce": to_sign["request_nonce"], "request_timestamp": to_sign["request_timestamp"],
+                "lease_id": lease_id, "signature": sign_payload(self.private_key, to_sign)}
+        resp = await client.post(
+            f"{self.api_base}/api/v1/jobs/device/jobs/{job_id}/lease/renew",
+            headers={"Authorization": f"Bearer {self.node_token}"}, json=body,
         )
+        if resp.status_code == 200:
+            return resp.json().get("lease")
+        logger.warning("lease_renew_failed", job_id=job_id, status=resp.status_code, body=resp.text[:200])
+        return None
 
-        return result
+    async def execute_with_lease(self, client: httpx.AsyncClient, job: dict[str, Any]) -> dict[str, Any]:
+        """Run a job while renewing its lease in the background."""
+        lease = getattr(self, "current_lease", None) or job.get("lease") or {}
+        lease_id = lease.get("lease_id")
+        interval = float(lease.get("renew_every_seconds") or 60)
+        task = asyncio.create_task(self.execute_job(job))
+        try:
+            while lease_id:
+                done, _ = await asyncio.wait({task}, timeout=interval)
+                if done:
+                    break
+                if await self.renew_lease(client, job["job_id"], lease_id) is None:
+                    break  # lease lost; finish anyway, server decides on submit
+            return await task
+        finally:
+            if not task.done():
+                await task
 
     async def execute_job_once(self, job: dict[str, Any]) -> dict[str, Any]:
         """Execute a job (convenience method)."""
@@ -312,11 +340,8 @@ class FarmosDeviceAgent:
         if not self.device_id or not self.node_token:
             return False
 
-        result_hash = hashlib.sha256(
-            json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-
-        result_uri = json.dumps(result)
+        # Canonical JSON (integral floats rendered as ints) — identical on Android.
+        result_hash, result_uri = result_hash_and_uri(result)
 
         # Sign ONLY the fields jobs.py verifies (exclude execution_metrics).
         to_sign = {
@@ -414,7 +439,7 @@ class FarmosDeviceAgent:
                             continue
 
                         # Execute job
-                        result = await self.execute_job(job)
+                        result = await self.execute_with_lease(client, job)
                         logger.info("job_executed", job_id=job_id, result_status=result.get("status"))
 
                         # Submit result
