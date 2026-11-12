@@ -17,6 +17,7 @@ dependencies = [
     "passlib[bcrypt]==1.7.4",
     "python-multipart==0.0.9",
     "httpx==0.27.2",
+    "httpcore==1.0.9",  # validated SNI extension for public-egress IP pinning
     "structlog==25.1.0",
     "python-json-logger==2.0.7",
     "tenacity==8.5.0",

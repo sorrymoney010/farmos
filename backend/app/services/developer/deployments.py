@@ -42,6 +42,7 @@ from app.services import lease_service as leases
 from app.services import opportunity_service as opps
 from app.services import profitability as prof
 from app.services.developer import billing, pricing, stripe_client
+from app.security.public_http import PublicHTTPTransport, public_address
 from app.services.finance.ledger import d
 from app.workloads import cpu_data
 
@@ -73,24 +74,26 @@ def check_url(url: Any, *, field: str = "url") -> str:
     internal hostnames, no credentials in the URL."""
     if not isinstance(url, str) or len(url) > 2048:
         raise DeploymentError(f"{field} must be a URL string (max 2048 chars)")
-    parts = urlsplit(url.strip())
-    allowed = ("https",) + (("http",) if settings.CUSTOMER_WEBHOOK_ALLOW_HTTP else ())
-    if parts.scheme not in allowed:
+    try:
+        parts = urlsplit(url.strip())
+        port = parts.port
+    except ValueError as exc:
+        raise DeploymentError(f"{field} is malformed") from exc
+    if parts.scheme != "https":
         raise DeploymentError(f"{field} must use https")
     host = (parts.hostname or "").lower().rstrip(".")
-    if not host or parts.username or parts.password:
+    if not host or parts.username or parts.password or "%" in host:
         raise DeploymentError(f"{field} must have a host and no credentials")
-    if host == "localhost" or host.endswith(BLOCKED_SUFFIXES) or "." not in host.strip("[]"):
+    if host == "localhost" or host.endswith(BLOCKED_SUFFIXES) or ("." not in host.strip("[]") and ":" not in host):
         raise DeploymentError(f"{field} host {host!r} is not a public hostname")
     try:
         ip = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
         ip = None
-    if ip is not None and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
-                           or ip.is_reserved or ip.is_unspecified):
+    if ip is not None and not public_address(str(ip)):
         raise DeploymentError(f"{field} points at a non-public address")
-    if parts.port is not None and parts.port not in (80, 443, 8080, 8443):
-        raise DeploymentError(f"{field} port {parts.port} not allowed (80/443/8080/8443)")
+    if port is not None and port not in (443, 8443):
+        raise DeploymentError(f"{field} port {port} not allowed (443/8443)")
     return url.strip()
 
 
@@ -500,7 +503,8 @@ async def deliver_pending(db: AsyncSession, now: Optional[datetime] = None, limi
     out = {"delivered": 0, "retrying": 0, "failed": 0}
     if not rows:
         return out
-    async with httpx.AsyncClient(transport=TRANSPORT, timeout=settings.CUSTOMER_WEBHOOK_TIMEOUT_SECONDS,
+    async with httpx.AsyncClient(transport=TRANSPORT if TRANSPORT is not None else PublicHTTPTransport(),
+                                 trust_env=False, timeout=settings.CUSTOMER_WEBHOOK_TIMEOUT_SECONDS,
                                  follow_redirects=False) as client:
         for dl, dep in rows:
             body = json.dumps(dl.payload, separators=(",", ":"), sort_keys=True).encode()

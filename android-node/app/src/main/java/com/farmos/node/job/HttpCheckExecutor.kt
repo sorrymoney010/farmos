@@ -52,11 +52,11 @@ object HttpCheckExecutor {
             builder.method(method, requestBody)
 
             val startNs = System.nanoTime()
-            httpClient.newCall(builder.build()).execute().use { response ->
+            PublicEgress.client(httpClient).newCall(builder.build()).execute().use { response ->
                 // Integer milliseconds: results avoid floats so canonical hashing
                 // is identical on Kotlin and Python (spec §59 result_hash).
                 val durationMs = (System.nanoTime() - startNs) / 1_000_000L
-                val preview = (response.body?.string().orEmpty()).take(1024)
+                val preview = response.peekBody(1024).string()
                 JSONObject()
                     .put("status", "COMPLETED")
                     .put("http_status", response.code)

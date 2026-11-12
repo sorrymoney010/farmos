@@ -197,3 +197,38 @@ Still open before a paid launch: connection-time egress protection (devices and
 server webhooks), processor settlement/fee reconciliation, a real payout provider,
 and full integration/physical-device evidence. Live billing and withdrawals have
 not been enabled by this change.
+
+## Public network egress — November 12, 2026
+
+Backend customer webhooks and HTTP/API/monitor job execution now use
+`PublicHTTPTransport`. It resolves the destination once per request, rejects any
+non-public answer (including mixed public/private sets and IPv6 transition
+ranges), and connects to the approved literal IP. The original hostname is used
+for Host, TLS SNI and certificate verification. Each request uses a new pool to
+avoid sharing TLS connections between different names on the same IP. Proxy
+environment variables and redirects are disabled. DNS has a five-second limit;
+raw responses are limited to 1 MiB. The transport requests identity encoding and
+rejects compressed responses to avoid decompression bypassing that bound.
+
+Admission and execution now require HTTPS on port 443 or 8443; the previous
+`CUSTOMER_WEBHOOK_ALLOW_HTTP` setting no longer relaxes destination admission.
+Local/intranet monitoring and endpoints requiring redirects or compression are
+not supported by this public-workload boundary. Test-only injected mock webhook
+transports still make no network calls.
+
+Android HttpCheckExecutor now uses PublicEgress: validates literal addresses,
+checks every DNS answer at OkHttp's connection resolution, disables redirects and
+proxies, and isolates its connection pool. Preview reads are bounded to 1024
+bytes instead of loading an entire response. No enrollment/control-plane URLs
+are changed. Public-address validation does not authorize scanning a destination;
+customers remain responsible for permission to monitor their targets.
+
+Validation: 186 backend unit tests passed (33 added in this phase); targeted
+undefined-name/import lint and whitespace checks passed. New JVM tests cover
+private/literal/mixed DNS, later rebinding, public IPv4/IPv6, URL credentials,
+ports and redirect settings. Android test execution was attempted but blocked
+because services.gradle.org could not resolve while downloading Gradle 8.9.
+Android compilation, physical-device behavior, live TLS network checks and the
+PostgreSQL integration suite are not verified by these results. Do not treat
+this as production or paid-launch approval. Next: obtain Android build/device
+evidence and complete processor settlement/fee reconciliation and real payouts.

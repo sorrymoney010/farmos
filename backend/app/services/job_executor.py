@@ -75,6 +75,7 @@ async def execute_job(db: AsyncSession, job: Job, device_id: UUID, result_payloa
 def _execute_http_check(payload: dict[str, Any], config: dict[str, float]) -> dict[str, Any]:
     """Execute an HTTP check job."""
     import httpx
+    from app.security.public_http import PublicHTTPTransport
 
     url_raw = payload.get("url")
     if not url_raw or not isinstance(url_raw, str):
@@ -86,7 +87,7 @@ def _execute_http_check(payload: dict[str, Any], config: dict[str, float]) -> di
 
     try:
         async def _run() -> dict[str, Any]:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout, transport=PublicHTTPTransport(), trust_env=False, follow_redirects=False) as client:
                 start = datetime.now(timezone.utc)
                 resp = await client.request(method, url, headers=headers)
                 duration_ms = (datetime.now(timezone.utc) - start).total_seconds() * 1000
@@ -117,6 +118,7 @@ def _execute_http_check(payload: dict[str, Any], config: dict[str, float]) -> di
 def _execute_api_request(payload: dict[str, Any], config: dict[str, float]) -> dict[str, Any]:
     """Execute an API request job."""
     import httpx
+    from app.security.public_http import PublicHTTPTransport
 
     url_raw = payload.get("url")
     if not url_raw or not isinstance(url_raw, str):
@@ -129,7 +131,7 @@ def _execute_api_request(payload: dict[str, Any], config: dict[str, float]) -> d
 
     try:
         async def _run() -> dict[str, Any]:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout, transport=PublicHTTPTransport(), trust_env=False, follow_redirects=False) as client:
                 start = datetime.now(timezone.utc)
                 resp = await client.request(method, url, json=body, headers=headers)
                 duration_ms = (datetime.now(timezone.utc) - start).total_seconds() * 1000
@@ -156,13 +158,14 @@ def _execute_api_request(payload: dict[str, Any], config: dict[str, float]) -> d
 def _execute_monitor(payload: dict[str, Any], config: dict[str, float]) -> dict[str, Any]:
     """Execute a monitoring job (uptime, response time, etc.)."""
     import httpx
+    from app.security.public_http import PublicHTTPTransport
 
     targets_raw = payload.get("targets", [])
     targets: list[str] = [str(t) for t in targets_raw if isinstance(t, (str, int, float))]
     results: list[dict[str, Any]] = []
 
     async def _run() -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, transport=PublicHTTPTransport(), trust_env=False, follow_redirects=False) as client:
             for target in targets:
                 try:
                     start = datetime.now(timezone.utc)
