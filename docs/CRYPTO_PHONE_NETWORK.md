@@ -1,4 +1,10 @@
-# FARMOS crypto phone network — active product direction
+# FARMOS native phone network
+
+The active core is our own Android worker, direct FARMOS enrollment, our own data
+jobs and verification, followed by crypto funding. Acurast is a design reference
+and an optional legacy integration, not a required account, app or service.
+
+# Historical initial fleet phase (superseded below)
 
 FARMOS is an Acurast-style useful-compute phone network with crypto compensation.
 The intended upgrade is better onboarding, hardware protection, workload selection,
@@ -53,3 +59,50 @@ installation; upgrade and verify it before deploying the web application.
 Android/physical-device validation remains open. Existing public bridge status
 routes also need a privacy/compatibility review before public deployment; this
 phase's new endpoint is authenticated and does not expose SSIDs.
+
+
+## Native enrollment and data pilot — current phase
+
+The /crypto-fleet page now reads native /admin/fleet devices. It creates one-time
+claim codes through /devices/claim-code, lets the owner select a device and edit
+JSON document/ops, creates a local json_transform pilot job, dispatches it, and
+retrieves the independently verified result. No Acurast calls are made by this
+flow. Existing bridge code is retained as an optional integration.
+
+Pilot jobs have pilot_mode=true, zero expected gross revenue and manual dispatch.
+Only OWNER/ADMIN can create jobs. Local CPU/data workloads alone are allowed in
+pilot mode; the server still validates payloads. Dispatch checks device safety,
+fresh heartbeat and active-lease capacity. Auto-scheduling is off. Pilot jobs
+receive neither test earnings credits nor revenue confirmation. Costs may still
+be measured. A result hash plus deterministic verification is evidence of work,
+not evidence of payment. The UI uses zero retries for its one-device pilot.
+
+GET /jobs/{job_id}/verified-result returns the stored JSON and hash only after
+PASSED verification, respecting job ownership and staff roles. Customer job
+isolation from PR #8 was selectively reused without its Stripe code.
+
+Android enrollment now saves and validates the entered server origin before the
+claim exchange, forbids changing servers while enrolled, disables enrollment HTTP
+redirects and removes logs containing token prefixes or enrollment response bodies.
+The expired hard-coded tunnel is replaced with farmos.invalid: supply a real
+HTTPS server origin; the placeholder cannot be enrolled against.
+
+### What the owner will do once APK and backend are available
+
+1. Install FARMOS Node on compatible Android (current project minSdk 31 / Android 12).
+2. Open /crypto-fleet on the deployed FARMOS dashboard with an owner/admin token.
+3. Create a pairing code. In FARMOS Node enter the deployed API HTTPS origin and
+   that code, then tap Enroll. No admin token goes on the phone.
+4. Keep the app open and phone cool/powered; wait for benchmark and heartbeats.
+5. Refresh phones, select it, edit the JSON job, run the unfunded pilot, and check
+   until independent verification passes. Save the result/hash as test evidence.
+
+No APK was built or physical device connected in this phase. Gradle download has
+been blocked in this environment. The backend is not deployed by these changes.
+Web dependencies retain the previously documented upgrade gate. No live income,
+crypto payment or 24-hour background worker behavior is claimed. Crypto-funded
+job acceptance/settlement and actual phone validation remain subsequent work.
+
+Current validation: 147 backend unit tests passed, including reused access-control
+regressions and new pilot/result/zero-credit tests. The frontend production build
+passed. These tests do not substitute for PostgreSQL end-to-end or Android tests.

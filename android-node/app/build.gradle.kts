@@ -14,7 +14,7 @@ android {
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField("String", "FARMOS_API_BASE_URL", "\"https://depends-goals-stays-portsmouth.trycloudflare.com\"")
+        buildConfigField("String", "FARMOS_API_BASE_URL", "\"https://farmos.invalid\"")
         buildConfigField("boolean", "FARMOS_ALLOW_INSECURE_HTTP", "false")
     }
 
@@ -23,7 +23,7 @@ android {
             isMinifyEnabled = false
             // Staging HTTPS tunnel — no cleartext, no emulator loopback.
             buildConfigField("boolean", "FARMOS_ALLOW_INSECURE_HTTP", "false")
-            buildConfigField("String", "FARMOS_API_BASE_URL", "\"https://depends-goals-stays-portsmouth.trycloudflare.com\"")
+            buildConfigField("String", "FARMOS_API_BASE_URL", "\"https://farmos.invalid\"")
         }
         release {
             isMinifyEnabled = false
@@ -33,7 +33,7 @@ android {
             )
             // Production: HTTPS only, never cleartext.
             buildConfigField("boolean", "FARMOS_ALLOW_INSECURE_HTTP", "false")
-            buildConfigField("String", "FARMOS_API_BASE_URL", "\"https://farmos.local\"")
+            buildConfigField("String", "FARMOS_API_BASE_URL", "\"https://farmos.invalid\"")
         }
     }
 

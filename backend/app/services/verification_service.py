@@ -349,7 +349,8 @@ async def finalize(db: AsyncSession, job: Job, result: JobResult, outcome: Outco
         if device is not None:
             response["reputation"] = await rep.record_outcome(db, device, rep.PASS, job_id=job.id, now=now)
         # Credit ONLY after verification, only for customer (PRIMARY) work.
-        if (auto_credit_test and role == PRIMARY and job.workload_type != JobType.BENCHMARK.value):
+        if (auto_credit_test and role == PRIMARY and job.workload_type != JobType.BENCHMARK.value
+                and not (job.constraints or {}).get("pilot_mode")):
             await credit_device_earnings(db, job, result.device_id, result, is_real_revenue=False)
             response["test_earnings_credited"] = True
         # Actual job economics replace estimates (spec §65), once, PRIMARY work only.
