@@ -158,6 +158,44 @@ class Settings(BaseSettings):
     SCHEDULER_AGING_MAX: float = 200.0
     JOB_AUTO_SCHEDULE_DEFAULT: bool = True      # new jobs go CREATED->VALIDATED->QUEUED
 
+    # ── Sprint 16: developer platform, prepaid billing, Stripe (spec §101-§104, §134-§136) ──
+    # Stripe credentials come ONLY from the environment; nothing is committed.
+    # sk_test_/rk_test_ keys -> TEST book. Live keys are refused unless
+    # STRIPE_LIVE_MODE_ENABLED=true AND APP_ENV=production (owner go-live switch).
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_API_BASE: str = "https://api.stripe.com"
+    STRIPE_LIVE_MODE_ENABLED: bool = False
+    STRIPE_WEBHOOK_TOLERANCE_SECONDS: int = 300
+    STRIPE_CHECKOUT_SUCCESS_URL: str = "http://localhost:3000/developer?topup=success"
+    STRIPE_CHECKOUT_CANCEL_URL: str = "http://localhost:3000/developer?topup=cancel"
+    STRIPE_HTTP_TIMEOUT_SECONDS: float = 15.0
+    TOPUP_MIN_USD: float = 5.0
+    TOPUP_MAX_USD: float = 1000.0
+    CUSTOMER_LOW_BALANCE_USD: float = 1.0
+    # pricing (spec §170-§172): price = max((fixed costs + verification + risk) * (1+margin)
+    # / (1 - variable fee share), minimum); margin floor enforced on every quote
+    PRICING_TARGET_MARGIN: float = 0.35
+    PRICING_RISK_PREMIUM: float = 0.10
+    PRICING_VERIFICATION_USD: float = 0.00002
+    PRICING_MIN_PRICE_USD: float = 0.0005
+    PRICING_MIN_CONTRIBUTION_MARGIN: float = 0.20
+    PRICING_RESERVE_BUFFER: float = 0.20        # maximum_cost = estimate * (1 + buffer); unused part is released
+    PRICING_URGENT_PRIORITY: int = 500
+    PRICING_URGENCY_PREMIUM: float = 0.25
+    QUOTE_TTL_SECONDS: int = 900
+    # deployments
+    DEPLOYMENT_MIN_INTERVAL_SECONDS: int = 60
+    DEPLOYMENT_MAX_RUNS: int = 100000
+    DEPLOYMENT_MAX_ACTIVE_PER_CUSTOMER: int = 50
+    DEPLOYMENT_MAX_MONITOR_TARGETS: int = 10
+    DEPLOYMENT_TICK_BATCH: int = 200
+    DEPLOYMENT_RUN_TTL_SECONDS: int = 3600   # an unscheduled run expires (reservation released)
+    CUSTOMER_WEBHOOK_MAX_ATTEMPTS: int = 6
+    CUSTOMER_WEBHOOK_TIMEOUT_SECONDS: float = 10.0
+    CUSTOMER_WEBHOOK_ALLOW_HTTP: bool = False   # dev only: allow http:// in deployment URLs + webhooks
+    API_KEY_TOUCH_SECONDS: int = 60             # last_used_at write throttle
+
     # ── Sprint 10: external adapter hardening (spec §126, §127, §139) ─────────
     ADAPTER_CALL_TIMEOUT_SECONDS: float = 10.0     # every adapter call is bounded
     ADAPTER_CIRCUIT_FAILURE_THRESHOLD: int = 3     # consecutive failures -> circuit opens

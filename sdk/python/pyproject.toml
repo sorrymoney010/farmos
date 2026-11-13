@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "farmos-sdk"
+version = "0.1.0"
+description = "Python SDK + CLI for the FARMOS developer platform (deploy work to the FARMOS phone fleet)"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.25"]
+
+[project.scripts]
+farmos = "farmos_sdk.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["farmos_sdk*"]

@@ -114,7 +114,7 @@ export default function Home() {
         <h1>V1 Operations Dashboard</h1>
         <p className="status">Devices · Jobs · Earnings · Wireless claim codes</p>
         <p className="muted">
-          API: <a href={`${apiUrl}/docs`}>{apiUrl}/docs</a>
+          API: <a href={`${apiUrl}/docs`}>{apiUrl}/docs</a> · <a href="/developer">Developer dashboard</a>
         </p>
       </header>
 

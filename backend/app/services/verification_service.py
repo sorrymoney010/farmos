@@ -356,6 +356,12 @@ async def finalize(db: AsyncSession, job: Job, result: JobResult, outcome: Outco
         if role == PRIMARY and job.workload_type != JobType.BENCHMARK.value:
             from app.services import economics_service as econ
             response["economics"] = await econ.finalize_job(db, job, result, now)
+            # Sprint 16: customer deployment runs are charged against prepaid credit
+            # only now (verified work), and revenue is confirmed from that charge.
+            from app.services.developer import billing as cust_billing
+            billed = await cust_billing.on_job_verified(db, job)
+            if billed is not None:
+                response["customer_billing"] = billed
     else:
         to = JobStatus.FAILED if outcome.device_failed else JobStatus.INVALID_RESULT
         leases.add_event(db, job.id, JobStatus.VERIFYING.value, to.value,
