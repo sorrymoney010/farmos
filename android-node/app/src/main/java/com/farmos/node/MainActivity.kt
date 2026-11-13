@@ -67,6 +67,7 @@ class MainActivity : AppCompatActivity() {
                 statusBody.text = "Generating Keystore identity and enrolling…"
                 val useClaim = !token.startsWith("enroll-") && token.length <= 16
                 runCatching {
+                    identityStore.setApiBase(apiUrlInput.text.toString().trim())
                     if (useClaim) repository.enrollWithClaimCode(token) else repository.enroll(token)
                 }
                     .onSuccess { result ->

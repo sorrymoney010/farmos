@@ -64,6 +64,10 @@ class DeviceIdentityStore(context: Context) {
     }
 
     fun setApiBase(url: String) {
+        val parsed = java.net.URI(url)
+        require(parsed.host != null && parsed.rawUserInfo == null && parsed.rawQuery == null && parsed.rawFragment == null && (parsed.path.isNullOrEmpty() || parsed.path == "/")) { "Enter the FARMOS server origin without credentials, query or path" }
+        require(parsed.host != "farmos.invalid") { "Enter your deployed FARMOS HTTPS URL" }
+        require(!isEnrolled() || url.trimEnd('/') == apiBaseUrl().trimEnd('/')) { "An enrolled device cannot switch servers" }
         require(url.startsWith("https://") || BuildConfig.FARMOS_ALLOW_INSECURE_HTTP) {
             "Only HTTPS API URLs are permitted (cleartext allowed only in dev builds)."
         }

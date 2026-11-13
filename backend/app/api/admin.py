@@ -45,6 +45,9 @@ async def admin_fleet(
             {
                 "device_id": str(d.id),
                 "human_id": d.human_id,
+                "source": "farmos_native",
+                "earning_status": "UNVERIFIED",
+                "confirmed_rewards": None,
                 "status": d.status.value,
                 "farm_score": float(d.farm_score) if d.farm_score is not None else None,
                 "temperature_state": d.temperature_state or "UNKNOWN",

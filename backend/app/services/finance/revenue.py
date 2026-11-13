@@ -167,6 +167,9 @@ async def confirm_revenue(db: AsyncSession, *, job_ids: list | None = None, limi
             report["skipped"][jid] = "no device"
             continue
         job = (await db.execute(select(Job).where(Job.id == row.job_id))).scalar_one()
+        if (job.constraints or {}).get("pilot_mode"):
+            report["skipped"][jid] = "unfunded device pilot; not revenue"
+            continue
         conf = source.confirm(row)
         row.confirmation_source, row.confirmation_ref, row.ledger_book = source.name, conf.reference, source.book
         if conf.status == "DISPUTED":

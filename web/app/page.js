@@ -111,7 +111,8 @@ export default function Home() {
     <main className="dash">
       <header className="hero">
         <p className="eyebrow">FARMOS</p>
-        <h1>V1 Operations Dashboard</h1>
+        <h1>FARMOS Operations Dashboard</h1>
+        <a href="/crypto-fleet">Crypto phone fleet →</a>
         <p className="status">Devices · Jobs · Earnings · Wireless claim codes</p>
         <p className="muted">
           API: <a href={`${apiUrl}/docs`}>{apiUrl}/docs</a>

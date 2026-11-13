@@ -11,7 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select, update
+from sqlalchemy import desc, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -24,10 +24,12 @@ from app.db.models.enums import (
     LedgerAccountType,
     LedgerDirection,
 )
+from app.db.models.core import Role, UserRole
 from app.db.models.devices import Device
 from app.db.models.jobs_ledger import (
     Job,
     JobAssignment,
+    JobLease,
     JobResult,
     LedgerAccount,
     LedgerEntry,
@@ -59,6 +61,7 @@ SYSTEM_WORKLOADS = {"benchmark"}
 # ── Shared request models ─────────────────────────────────────────────────────
 
 class JobCreateRequest(BaseModel):
+    pilot_mode: bool = False
     workload_type: str
     payload: dict[str, Any] = Field(default_factory=dict)
     expected_revenue_usd: float | None = None
@@ -142,10 +145,15 @@ def _verification_view(job: Job) -> dict[str, Any] | None:
 async def create_job(
     req: JobCreateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(require_roles("OWNER", "ADMIN", "CUSTOMER")),
+    current_user=Depends(require_roles("OWNER", "ADMIN")),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=128),
 ):
     job_type = req.workload_type
+    if req.pilot_mode:
+        if job_type not in cpu_data.CPU_DATA_WORKLOADS:
+            raise HTTPException(400, "Pilot supports local CPU/data workloads only")
+        req.expected_revenue_usd = 0
+        req.auto_schedule = False
     try:
         JobType(job_type)
     except ValueError:
@@ -193,6 +201,9 @@ async def create_job(
     if "tier" in constraints and str(constraints["tier"]).upper() not in prof.TIER_MULTIPLIER:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tier must be STANDARD|PRIORITY|ENTERPRISE")
 
+    if req.pilot_mode:
+        constraints["pilot_mode"] = True
+
     job = Job(
         workload_type=job_type,
         status=JobStatus.CREATED,
@@ -226,7 +237,7 @@ async def create_job(
         score = prof.score_opportunity(est, terms, prof.DeviceProfile())
         await econ.record_estimate(db, job, None, est, status="ESTIMATED" if est.profitable else "REJECTED",
                                    opportunity_score=score, inputs={"reference_device": True})
-        if not est.profitable:
+        if not est.profitable and not req.pilot_mode:
             rejected_reason = (f"unprofitable: expected net ${est.expected_net_profit_usd:.8f} "
                                f"(gross ${est.adjusted_gross_usd:.8f} - costs ${est.total_cost_usd:.8f})")
     if rejected_reason:
@@ -248,6 +259,21 @@ async def create_job(
             "expected_net_usd": float(job.expected_profit_usd) if job.expected_profit_usd is not None else None}
 
 
+def visible_jobs(user_id: UUID):
+    """Scope before pagination/lookup; customer ownership uses the user UUID.
+
+    Deployment.customer_id is a different (billing account) identifier.
+    Explicit staff roles retain operational access even on multi-role accounts.
+    """
+    staff = (
+        select(UserRole.id)
+        .join(Role, UserRole.role_id == Role.id)
+        .where(UserRole.user_id == user_id, Role.name.in_(("OWNER", "ADMIN", "OPERATIONS")))
+        .exists()
+    )
+    return select(Job).where(or_(Job.customer_id == user_id, staff))
+
+
 # ── List jobs ─────────────────────────────────────────────────────────────────
 
 @router.get("/")
@@ -255,7 +281,7 @@ async def list_jobs(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS", "CUSTOMER")),
 ):
-    result = await db.execute(select(Job).order_by(desc(Job.created_at)).limit(100))
+    result = await db.execute(visible_jobs(current_user.id).order_by(desc(Job.created_at)).limit(100))
     jobs = result.scalars().all()
     return [
         {
@@ -277,7 +303,7 @@ async def get_job(
 ):
     # Eager-load relationships: lazy loading is not allowed under asyncio.
     result = await db.execute(
-        select(Job)
+        visible_jobs(current_user.id)
         .options(selectinload(Job.assignment), selectinload(Job.verification))
         .where(Job.id == job_id)
     )
@@ -329,11 +355,19 @@ async def dispatch_job(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail=f"Adapter {job.adapter_id} is disabled (kill switch)")
 
-    device = (await db.execute(select(Device).where(Device.id == req.device_id))).scalar_one_or_none()
+    device = (await db.execute(select(Device).where(Device.id == req.device_id).with_for_update())).scalar_one_or_none()
     if not device:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    active = (await db.execute(select(JobLease.id).where(
+        JobLease.device_id == device.id, JobLease.status == "ACTIVE").limit(1))).scalar_one_or_none()
+    if active is not None:
+        raise HTTPException(409, "Device already has an active job lease")
     # Coder rule §53.9: no device job without policy check (status + thermal + battery).
     now = datetime.now(timezone.utc)
+    if (job.constraints or {}).get("pilot_mode"):
+        seen = device.last_seen_at
+        if seen is None or (now - (seen.replace(tzinfo=timezone.utc) if seen.tzinfo is None else seen)).total_seconds() > settings.DEVICE_ONLINE_SECONDS:
+            raise HTTPException(409, "Pilot requires a fresh device heartbeat")
     thresholds = await bench_svc.thresholds_for_device(db, device)
     blocked = dispatch_block_reason(device, job.workload_type, thresholds, now)
     if blocked:
@@ -824,3 +858,25 @@ async def get_device_earnings(
             "note": "Real USDC earnings — requires verified customer payment",
         },
     }
+
+
+@router.get("/{job_id}/verified-result")
+async def verified_result(job_id: UUID, db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles("OWNER", "ADMIN", "OPERATIONS", "CUSTOMER"))):
+    job = (await db.execute(visible_jobs(current_user.id)
+        .options(selectinload(Job.verification)).where(Job.id == job_id))).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job.verification is None or job.verification.status != vsvc.PASSED:
+        raise HTTPException(409, "Result is not independently verified yet")
+    result = (await db.execute(select(JobResult).where(JobResult.job_id == job.id))).scalar_one_or_none()
+    if result is None:
+        raise HTTPException(409, "Verified result is not available")
+    try:
+        output = json.loads(result.result_uri) if result.result_uri else None
+    except (TypeError, ValueError):
+        output = None
+    return {"job_id": str(job.id), "verification": _verification_view(job),
+            "result_hash": result.result_hash, "result": output,
+            "pilot_mode": bool((job.constraints or {}).get("pilot_mode")),
+            "confirmed_crypto_payment": None}

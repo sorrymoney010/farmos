@@ -195,3 +195,27 @@ async def all_processor_statuses(db: AsyncSession = Depends(get_db)):
         .order_by(AcurastProcessor.last_reported_at.desc())
     )
     return {"processorStatuses": [_status_payload(processor) for processor in result.scalars()]}
+
+
+@admin_router.get("/fleet-readiness")
+async def fleet_readiness(
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_roles(RoleName.OWNER, RoleName.ADMIN, RoleName.OPERATIONS)),
+    limit: int = 100,
+    offset: int = 0,
+):
+    """Authenticated phone telemetry only; bridge records cannot prove rewards."""
+    from app.services.crypto_fleet import processor_readiness
+    if not 1 <= limit <= 200 or offset < 0:
+        raise HTTPException(400, "limit must be 1–200 and offset nonnegative")
+    result = await db.execute(select(AcurastProcessor).order_by(AcurastProcessor.id)
+                              .offset(offset).limit(limit + 1))
+    rows = list(result.scalars().all())
+    now = datetime.now(timezone.utc)
+    items = [processor_readiness(p, now=now,
+             stale_seconds=max(60, settings.ACURAST_CHECKIN_REFRESH_SECONDS * 2)) for p in rows[:limit]]
+    return {"items": items, "has_more": len(rows) > limit,
+            "next_offset": offset + limit if len(rows) > limit else None,
+            "observed_at": now.isoformat(), "telemetry_ready_in_page": sum(p['telemetry_ready'] for p in items),
+            "reward_verification": "NOT_CONNECTED", "confirmed_rewards": None,
+            "note": "Telemetry readiness is not attestation, paid job supply or verified crypto income."}

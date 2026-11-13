@@ -1,6 +1,15 @@
 # FARMOS — Distributed Edge Revenue Operating System
 
-## Phase 1 Foundation (Current)
+## Active direction: crypto phone compute network
+
+FARMOS coordinates useful work on old phones with verified crypto rewards.
+Direct enrollment uses the FARMOS Node app and our own data jobs; no Acurast
+account or app is required for the native pilot.
+See [Crypto phone network](docs/CRYPTO_PHONE_NETWORK.md) for the current build
+sequence and the new `/crypto-fleet` readiness view. Signed check-ins are not
+proof of network eligibility or income. Stripe is outside this core build path.
+
+## Historical Phase 1 Foundation
 
 ### What's implemented
 - Repository scaffold: `backend/`, `web/`, `android-node/`, `sdk/`, `docs/`, `infra/`, `scripts/`
