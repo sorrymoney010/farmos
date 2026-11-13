@@ -176,3 +176,27 @@ def verify_and_parse(payload: bytes, header: Optional[str], secret: Optional[str
     if not isinstance(event, dict) or "id" not in event or "type" not in event:
         raise SignatureError("payload is not a Stripe event")
     return event
+
+
+async def retrieve_payment_evidence(payment_intent_id: str) -> dict[str, Any]:
+    """Read only, fixed Stripe origin; never return client secrets to API callers."""
+    import re
+    if not re.fullmatch(r"pi_[A-Za-z0-9]+", payment_intent_id):
+        raise StripeError("invalid stored payment intent identifier", 400)
+    require_enabled()
+    async with httpx.AsyncClient(base_url="https://api.stripe.com", transport=TRANSPORT,
+                                 trust_env=False, follow_redirects=False,
+                                 timeout=settings.STRIPE_HTTP_TIMEOUT_SECONDS) as client:
+        try:
+            response = await client.get(f"/v1/payment_intents/{payment_intent_id}",
+                params={"expand[]": "latest_charge.balance_transaction"},
+                headers={"Authorization": f"Bearer {settings.STRIPE_SECRET_KEY}",
+                         "Stripe-Version": "2024-06-20"})
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            # Do not expose processor responses, credentials or payment secrets.
+            raise StripeError("Stripe evidence retrieval failed") from exc
+    if not isinstance(data, dict):
+        raise StripeError("invalid Stripe evidence response")
+    return data

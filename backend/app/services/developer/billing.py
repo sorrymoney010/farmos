@@ -279,7 +279,10 @@ async def reconcile(db: AsyncSession, book: str) -> dict[str, Any]:
     if expected != liability:
         mismatches.append({"issue": "prepaid liability drift", "ledger_2020": str(liability),
                            "expected": str(expected)})
-    return {"book": book, "ok": not mismatches, "succeeded_topups": len(topups),
+    unbalanced = await ledger.unbalanced_transactions(db, book)
+    return {"book": book, "ok": not mismatches and not unbalanced,
+            "scope": "internal_ledger_only", "processor_verified": False,
+            "bank_receipt_verified": False, "succeeded_topups": len(topups),
             "stripe_funded_usd": str(stripe_total), "refunded_usd": str(refunded), "charged_usd": str(charged),
-            "prepaid_liability_usd": str(liability), "unbalanced_transactions": await ledger.unbalanced_transactions(db, book),
+            "prepaid_liability_usd": str(liability), "unbalanced_transactions": unbalanced,
             "mismatches": mismatches}

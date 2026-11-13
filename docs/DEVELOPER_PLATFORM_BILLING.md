@@ -232,3 +232,47 @@ Android compilation, physical-device behavior, live TLS network checks and the
 PostgreSQL integration suite are not verified by these results. Do not treat
 this as production or paid-launch approval. Next: obtain Android build/device
 evidence and complete processor settlement/fee reconciliation and real payouts.
+
+## Processor evidence comparison — November 13, 2026
+
+New finance-role read endpoint:
+`GET /api/v1/admin/developer/topups/{topup_id}/processor-reconciliation`.
+It retrieves the stored PaymentIntent from Stripe with
+`expand[]=latest_charge.balance_transaction`, using the existing secret's mode
+and pinned API version 2024-06-20. Restricted keys need read access to these
+objects. The request is GET-only, has a fixed api.stripe.com origin, disables
+redirects/environment proxies, validates the stored identifier and redacts
+upstream error bodies. No credentials were configured or live requests made in
+this implementation phase.
+
+The comparison checks the payment's identity, top-up/customer metadata, mode,
+USD currency, captured gross amount and local funded amount. It then checks the
+charge-to-balance-transaction link, transaction type, integer fee/net arithmetic,
+and processor pending/available state. Only matching evidence exposes matched
+gross, fee and net amounts in cents. Refunds, disputes, missing evidence,
+unsupported conversions or mismatches return REVIEW_REQUIRED. MATCHED means
+this individual funding record matches processor evidence; it does not mean the
+account is fully reconciled or that funds reached a bank/wallet. Reports contain
+no PaymentIntent client secrets or payment method details.
+
+This is a read-only, per-top-up comparison, not a settlement ingestion worker.
+It neither posts fees nor moves clearing balances nor releases withdrawals.
+USD processor evidence is deliberately not treated as USDC in the existing REAL
+book. Bank receipt, on-chain receipt and withdrawal authorization flags remain
+false. The existing `/reconcile` endpoint is now labeled internal_ledger_only,
+and returns ok=false when any unbalanced ledger transactions exist.
+
+Validation: 216 backend unit tests passed, including 30 added in this phase.
+Tests mock Stripe entirely and cover fees, pending funds, refunds/disputes,
+identity/currency/mode mismatch, duplicate read-only checks, secret redaction,
+path injection and disabled live mode. Targeted lint and whitespace checks pass.
+Android test execution was retried and remains blocked by DNS failure downloading
+Gradle from services.gradle.org. No deployment or payment activation occurred.
+
+Remaining work: durable settlement evidence, refund/dispute balance transactions,
+fees posted to an explicit fiat accounting book, payout/bank matching, USD-to-USDC
+conversion evidence, PostgreSQL integration and physical Android validation.
+
+API references checked:
+- https://docs.stripe.com/api/payment_intents/retrieve
+- https://docs.stripe.com/api/balance_transactions/object

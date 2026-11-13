@@ -456,3 +456,16 @@ async def admin_stripe_events(_=Depends(FINANCE), db: AsyncSession = Depends(get
              "related_topup_id": str(r.related_topup_id) if r.related_topup_id else None,
              "payload_hash": r.payload_hash, "received_at": r.received_at.isoformat() if r.received_at else None,
              "processed_at": r.processed_at.isoformat() if r.processed_at else None} for r in rows]
+
+
+@admin_router.get("/topups/{topup_id}/processor-reconciliation")
+async def admin_processor_reconciliation(topup_id: uuid.UUID, _=Depends(FINANCE),
+                                         db: AsyncSession = Depends(get_db)):
+    from app.services.developer.processor_reconciliation import reconcile_topup
+    topup = (await db.execute(select(CustomerTopup).where(CustomerTopup.id == topup_id))).scalar_one_or_none()
+    if topup is None:
+        raise HTTPException(404, "top-up not found")
+    try:
+        return await reconcile_topup(topup)
+    except stripe_client.StripeError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
